@@ -562,7 +562,7 @@ wss.on('connection', (ws) => {
         if(tid){
           const tw=connections.get(tid);
           const myScore=msg.score;
-          const oppScore=tw?.(tw._cbScore||0):0;
+          const oppScore = tw ? (tw._cbScore || 0) : 0;
           const winnerId=myScore>=oppScore?playerId:tid;
           send(ws,{type:'CLICKBATTLE_END',winnerId,myScore,oppScore});
           if(tw) send(tw,{type:'CLICKBATTLE_END',winnerId,myScore:oppScore,oppScore:myScore});
