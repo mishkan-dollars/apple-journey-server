@@ -26,18 +26,22 @@ const AJ_SERVER = {
 
   // Получить ник из всех возможных мест в игре
   getNick() {
+    // 1. Из сохранённого localStorage игры
     try {
       const saved = localStorage.getItem('appleRebirthGame');
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (parsed.username) return parsed.username;
-        if (parsed.playerNickname) return parsed.playerNickname;
+        if (parsed.username && parsed.username.length >= 2) return parsed.username;
+        if (parsed.playerNickname && parsed.playerNickname.length >= 2) return parsed.playerNickname;
       }
     } catch(e) {}
-    return window.gameData?.username
-        || window.gameData?.playerNickname
-        || localStorage.getItem('aj_nickname')
-        || null;
+    // 2. Из gameData если уже загружено
+    if (window.gameData?.username && window.gameData.username.length >= 2) return window.gameData.username;
+    if (window.gameData?.playerNickname && window.gameData.playerNickname.length >= 2) return window.gameData.playerNickname;
+    // 3. Из нашего localStorage
+    const saved = localStorage.getItem('aj_nickname');
+    if (saved && saved.length >= 2 && saved !== 'Игрок') return saved;
+    return null;
   },
 
   async auth(nickname) {
@@ -504,7 +508,7 @@ const FriendsUI = {
               <div style="display:flex;align-items:center;gap:8px;">
                 <span style="width:8px;height:8px;border-radius:50%;background:${f.online?'#00ff41':'#333'};flex-shrink:0;box-shadow:${f.online?'0 0 6px #00ff41':'none'};"></span>
                 <div>
-                  <div style="color:var(--matrix-green);font-size:13px;">${f.nickname}</div>
+                  <div style="color:var(--matrix-green);font-size:13px;">${f.nickname||f.nick||'???'}</div>
                   <div style="color:#44bb44;font-size:10px;">${f.online?'🟢 В сети':'⚫ Не в сети'} • ${f.id}</div>
                 </div>
               </div>
@@ -849,56 +853,51 @@ function injectFriendsSection() {
 //  INIT
 // ================================================================
 async function initMultiplayer() {
-  const savedId    = localStorage.getItem('aj_player_id');
-  const savedToken = localStorage.getItem('aj_device_token');
-
   injectFriendsSection();
 
+  let authAttempts = 0;
+
   async function tryConnect() {
+    authAttempts++;
     const nick = AJ_SERVER.getNick();
-    if (!nick) { setTimeout(tryConnect, 1000); return; }
+    console.log('[MP] tryConnect attempt', authAttempts, 'nick:', nick);
+
+    if (!nick) {
+      if (authAttempts < 30) setTimeout(tryConnect, 1000);
+      return;
+    }
+
     try {
-      await AJ_SERVER.auth(nick);
+      const result = await AJ_SERVER.auth(nick);
+      console.log('[MP] Auth OK:', result.playerId, result.nickname);
+      localStorage.setItem('aj_nickname', result.nickname);
       AJ_SERVER.connect();
+
       setTimeout(() => {
+        showIdInBar();
         if (typeof showNotification === 'function')
           showNotification('🆔 Ваш ID', AJ_SERVER.playerId, 'unlock');
         FriendsUI.render();
-      }, 1500);
+      }, 1000);
     } catch(e) {
-      console.warn('Multiplayer auth error:', e);
-      setTimeout(tryConnect, 3000);
+      console.warn('[MP] Auth error:', e);
+      if (authAttempts < 10) setTimeout(tryConnect, 3000);
     }
   }
 
-  // Если есть сохранённый аккаунт — пробуем сразу
-  if (savedId && savedToken) {
-    tryConnect();
-  }
-
-  // Хук на кнопку ника — ждём пока появится
-  function hookNickBtn() {
-    const btn = document.getElementById('nickname-confirm-btn');
-    if (!btn) { setTimeout(hookNickBtn, 500); return; }
-    btn.addEventListener('click', () => {
-      setTimeout(async () => {
-        if (!AJ_SERVER.playerId) tryConnect();
-      }, 1200);
-    });
-  }
-  hookNickBtn();
-
-  // Показать ID в инфо-баре
   function showIdInBar() {
-    const id = AJ_SERVER.playerId || savedId;
+    const id = AJ_SERVER.playerId || localStorage.getItem('aj_player_id');
     if (!id) { setTimeout(showIdInBar, 2000); return; }
     const infoBar = document.querySelector('.player-info-bar');
     if (!infoBar) { setTimeout(showIdInBar, 1000); return; }
-    if (document.getElementById('aj-id-badge')) return;
+    // Удалить старый если есть
+    const old = document.getElementById('aj-id-badge');
+    if (old) old.remove();
     const badge = document.createElement('span');
     badge.id = 'aj-id-badge';
-    badge.style.cssText = 'font-size:10px;color:#44bb44;cursor:pointer;border:1px solid rgba(0,255,65,0.3);border-radius:4px;padding:1px 6px;margin-left:4px;white-space:nowrap;';
+    badge.style.cssText = 'font-size:10px;color:#44bb44;cursor:pointer;border:1px solid rgba(0,255,65,0.3);border-radius:4px;padding:2px 7px;margin-left:6px;white-space:nowrap;letter-spacing:1px;';
     badge.textContent = id;
+    badge.title = 'Нажми для копирования';
     badge.onclick = () => {
       navigator.clipboard.writeText(id).catch(()=>{});
       if (typeof showNotification === 'function')
@@ -906,7 +905,21 @@ async function initMultiplayer() {
     };
     infoBar.appendChild(badge);
   }
-  setTimeout(showIdInBar, 2500);
+
+  // Хук на кнопку подтверждения ника
+  function hookNickBtn() {
+    const btn = document.getElementById('nickname-confirm-btn');
+    if (!btn) { setTimeout(hookNickBtn, 300); return; }
+    btn.addEventListener('click', () => {
+      authAttempts = 0; // сброс счётчика
+      setTimeout(tryConnect, 800);
+    });
+    console.log('[MP] Nick button hooked');
+  }
+  hookNickBtn();
+
+  // Попробовать сразу если ник уже есть
+  setTimeout(tryConnect, 1000);
 }
 
 if (document.readyState === 'loading') {
