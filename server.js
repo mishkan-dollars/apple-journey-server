@@ -10,6 +10,7 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 app.use(express.json());
+app.use(express.static(__dirname));
 app.use(express.static('public'));
 
 // ============================================================
@@ -163,6 +164,17 @@ app.get('/api/status', (req, res) => {
     players: Object.keys(db.players).length,
     uptime: Math.floor(process.uptime())
   });
+});
+
+// Главная страница
+app.get('*', (req, res) => {
+  const indexPath = __dirname + '/public/index.html';
+  const rootPath = __dirname + '/index.html';
+  if (require('fs').existsSync(indexPath)) {
+    res.sendFile(indexPath);
+  } else {
+    res.sendFile(rootPath);
+  }
 });
 
 // ============================================================
