@@ -126,14 +126,15 @@ const AJ_SERVER = {
         if (typeof showNotification === 'function')
           showNotification('✅ Заявка отправлена', `Запрос отправлен: ${msg.targetNick}`, 'unlock');
         break;
-      case 'FRIEND_ADDED':
-        if (!this.friends.find(f => f.id === msg.friend.id))
-          this.friends.push(msg.friend);
-        this.friendRequests = this.friendRequests.filter(r => r.id !== msg.friend.id);
+      case 'FRIEND_ADDED': {
+        // Перезагружаем список друзей с сервера чтобы получить актуальные данные
+        this.friendRequests = this.friendRequests.filter(r => r.id !== msg.friend?.id);
         if (typeof showNotification === 'function')
-          showNotification('🎉 Новый друг!', `${msg.friend.nickname} теперь ваш друг`, 'unlock');
-        FriendsUI.render();
+          showNotification('🎉 Новый друг!', `${msg.friend?.nickname || 'Игрок'} теперь ваш друг`, 'unlock');
+        // Reload friends from server to get fresh data
+        await this.loadFriends();
         break;
+      }
       case 'FRIEND_DECLINED':
         this.friendRequests = this.friendRequests.filter(r => r.id !== msg.fromId);
         FriendsUI.render();
@@ -224,10 +225,17 @@ const AJ_SERVER = {
     try {
       const res = await fetch(`${this.HTTP}/api/friends/${this.playerId}`);
       const data = await res.json();
-      this.friends = data.friends || [];
-      this.friendRequests = data.incoming || [];
+      this.friends = (data.friends || []).map(f => ({
+        ...f,
+        nickname: f.nickname || f.nick || '???',
+        online: f.online || false
+      }));
+      this.friendRequests = (data.incoming || []).map(r => ({
+        ...r,
+        nickname: r.nickname || r.nick || '???'
+      }));
       FriendsUI.render();
-    } catch(e) {}
+    } catch(e) { console.warn('loadFriends error:', e); }
   },
 
   sendFriendRequest(targetId) { this.send({ type: 'FRIEND_REQUEST', targetId }); },
