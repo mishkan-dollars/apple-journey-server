@@ -19,28 +19,28 @@ app.use(express.static('public'));
 const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL || 'https://cosmic-snapper-73256.upstash.io';
 const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || 'gQAAAAAAAR4oAAIncDFjZjk3ZDE3ZjdiYWY0Nzk1OWMzOGZiNDMyMjk1YzQ2OXAxNzMyNTY';
 
-async function redisGet(key) {
+async function rGet(key) {
   try {
-    const res = await fetch(`${REDIS_URL}/get/${encodeURIComponent(key)}`, {
+    const r = await fetch(`${REDIS_URL}/get/${encodeURIComponent(key)}`, {
       headers: { Authorization: `Bearer ${REDIS_TOKEN}` }
     });
-    const data = await res.json();
-    if (data.result === null || data.result === undefined) return null;
-    try { return JSON.parse(data.result); } catch(e) { return data.result; }
-  } catch(e) { console.error('Redis GET error:', e); return null; }
+    const d = await r.json();
+    if (!d.result) return null;
+    try { return JSON.parse(d.result); } catch(e) { return d.result; }
+  } catch(e) { return null; }
 }
 
-async function redisSet(key, value) {
+async function rSet(key, value) {
   try {
     await fetch(`${REDIS_URL}/set/${encodeURIComponent(key)}`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${REDIS_TOKEN}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ value: JSON.stringify(value) })
     });
-  } catch(e) { console.error('Redis SET error:', e); }
+  } catch(e) {}
 }
 
-async function redisDel(key) {
+async function rDel(key) {
   try {
     await fetch(`${REDIS_URL}/del/${encodeURIComponent(key)}`, {
       method: 'POST',
@@ -49,111 +49,110 @@ async function redisDel(key) {
   } catch(e) {}
 }
 
-async function redisKeys(pattern) {
-  try {
-    const res = await fetch(`${REDIS_URL}/keys/${encodeURIComponent(pattern)}`, {
-      headers: { Authorization: `Bearer ${REDIS_TOKEN}` }
-    });
-    const data = await res.json();
-    return data.result || [];
-  } catch(e) { return []; }
-}
-
 // ============================================================
-//  PLAYER HELPERS
+//  PLAYER DB
 // ============================================================
-async function getPlayer(id) { return await redisGet(`player:${id}`); }
-async function savePlayer(p) { await redisSet(`player:${p.id}`, p); }
-async function getLobby(id) { return await redisGet(`lobby:${id}`); }
-async function saveLobby(l) { await redisSet(`lobby:${l.id}`, l); }
-async function delLobby(id) { await redisDel(`lobby:${id}`); }
+async function getPlayer(id) { return await rGet('p:' + id); }
+async function savePlayer(p) { await rSet('p:' + p.id, p); }
 async function getPlayerByToken(token) {
-  const id = await redisGet(`token:${token}`);
+  const id = await rGet('t:' + token);
   if (!id) return null;
   return await getPlayer(id);
 }
 
 // ============================================================
-//  CONNECTIONS
+//  IN-MEMORY STATE
 // ============================================================
-const connections = new Map();
-const wsToPlayer  = new Map();
-const gameRooms   = new Map();
+const conns = new Map();      // playerId -> ws
+const wsMap = new Map();      // ws -> playerId
+const playerLobby = new Map(); // playerId -> lobbyId
 
 // ============================================================
 //  MATCHMAKING QUEUE
 // ============================================================
-let matchQueue = []; // [{playerId, joinedAt, charIcon, nick}]
-const MATCH_SIZE = 10;       // макс игроков в матче
-const MATCH_WAIT = 10000;    // 10 секунд ждём
-let matchTimer = null;
+let queue = null;
 
-function startMatchTimer() {
-  if (matchTimer) return;
-  matchTimer = setTimeout(() => {
-    launchMatch();
-  }, MATCH_WAIT);
+function mmJoin(playerId, nick, charIcon) {
+  if (!queue) {
+    queue = {
+      id: uuidv4().slice(0,8).toUpperCase(),
+      players: [],
+      startTime: Date.now(),
+      secondsLeft: 10
+    };
+    queue.timer = setInterval(() => mmTick(), 1000);
+    console.log('[MM] Новая очередь', queue.id);
+  }
+
+  if (queue.players.find(p => p.id === playerId)) return;
+  queue.players.push({ id: playerId, nick: nick || '???', charIcon: charIcon || '🍎' });
+  console.log('[MM] Игрок', nick, '| В очереди:', queue.players.length);
+
+  mmBroadcast();
+
+  if (queue.players.length >= 10) mmLaunch();
 }
 
-function launchMatch() {
-  clearTimeout(matchTimer);
-  matchTimer = null;
-  if (matchQueue.length < 1) return;
+function mmLeave(playerId) {
+  if (!queue) return;
+  queue.players = queue.players.filter(p => p.id !== playerId);
+  if (queue.players.length === 0) {
+    clearInterval(queue.timer);
+    queue = null;
+  } else {
+    mmBroadcast();
+  }
+}
 
-  const players = matchQueue.splice(0, MATCH_SIZE);
-  const roomId = 'MATCH-' + Date.now();
+function mmTick() {
+  if (!queue) return;
+  queue.secondsLeft--;
+  mmBroadcast();
+  if (queue.secondsLeft <= 0) mmLaunch();
+}
 
-  // Назначить команды
+function mmBroadcast() {
+  if (!queue) return;
+  queue.players.forEach(p => {
+    const ws = conns.get(p.id);
+    if (ws) send(ws, {
+      type: 'MM_UPDATE',
+      found: queue.players.length,
+      total: 10,
+      timeLeft: queue.secondsLeft,
+      players: queue.players.map(x => ({ nick: x.nick, charIcon: x.charIcon }))
+    });
+  });
+}
+
+function mmLaunch() {
+  if (!queue || queue.players.length === 0) return;
+  clearInterval(queue.timer);
+  const q = queue;
+  queue = null;
+
+  console.log('[MM] Запуск матча! Игроков:', q.players.length);
+
   const teams = {};
-  players.forEach((p, i) => { teams[p.playerId] = i % 2 === 0 ? 'A' : 'B'; });
+  q.players.forEach((p, i) => { teams[p.id] = i % 2 === 0 ? 'A' : 'B'; });
 
-  const playersInfo = players.map(p => ({
-    id: p.playerId,
-    nickname: p.nick || '???',
-    team: teams[p.playerId],
-    charIcon: p.charIcon || '🍎'
+  const playersInfo = q.players.map(p => ({
+    id: p.id,
+    nickname: p.nick,
+    team: teams[p.id],
+    charIcon: p.charIcon
   }));
 
-  // Создать игровую комнату
-  const room = new GameRoom(roomId, playersInfo);
-  gameRooms.set(roomId, room);
-
-  // Сохранить лобби маппинг
-  players.forEach(p => playerLobbies.set(p.playerId, roomId));
-
-  // Запустить у всех
-  const pids = players.map(p => p.playerId);
-  broadcast(pids, {
-    type: 'LOBBY_KB_START',
-    lobbyId: roomId,
-    roomId,
-    teams,
-    players: playersInfo,
-    isMatchmaking: true
+  q.players.forEach(p => {
+    const ws = conns.get(p.id);
+    if (ws) send(ws, {
+      type: 'MM_LAUNCH',
+      roomId: q.id,
+      teams,
+      players: playersInfo,
+      realPlayers: q.players.length
+    });
   });
-
-  console.log('[Matchmaking] Запущен матч:', roomId, 'игроков:', players.length);
-
-  // Если остались в очереди — запустить новый таймер
-  if (matchQueue.length > 0) startMatchTimer();
-}
-
-function broadcastQueueUpdate() {
-  matchQueue.forEach(p => {
-    const ws = connections.get(p.playerId);
-    if (ws) send(ws, { type: 'QUEUE_UPDATE', count: matchQueue.length, max: MATCH_SIZE });
-  });
-}
-const playerLobbies = new Map(); // playerId -> lobbyId (in-memory)
-
-// ============================================================
-//  GENERATE ID
-// ============================================================
-function generatePlayerId() {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  const p1 = Array.from({length:4}, () => chars[Math.floor(Math.random()*chars.length)]).join('');
-  const p2 = Array.from({length:4}, () => chars[Math.floor(Math.random()*chars.length)]).join('');
-  return `AJ-${p1}-${p2}`;
 }
 
 // ============================================================
@@ -162,274 +161,85 @@ function generatePlayerId() {
 function send(ws, msg) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
 }
-function broadcast(playerIds, msg) {
-  playerIds.forEach(pid => { const ws = connections.get(pid); if (ws) send(ws, msg); });
-}
-function getOnlineStatus(pid) { return connections.has(pid); }
 
-// ============================================================
-//  GAME ROOM
-// ============================================================
-class GameRoom {
-  constructor(lobbyId, players) {
-    this.id = lobbyId;
-    this.players = players;
-    this.states = {};
-    this.kills = {};
-    this.finished = false;
-    this.tick = 0;
-
-    players.forEach(p => {
-      this.states[p.id] = {
-        x: 800 + Math.random()*400-200, y: 600 + Math.random()*400-200,
-        hp: 1000, maxHp: 1000, alive: true,
-        charIcon: p.charIcon||'🍎', nick: p.nickname, team: p.team, superCharge: 0, emojiId: null
-      };
-      this.kills[p.id] = 0;
-    });
-
-    this.interval = setInterval(() => this.broadcastState(), 50);
-  }
-
-  updateState(pid, state) {
-    if (this.states[pid]) Object.assign(this.states[pid], state);
-  }
-
-  addProjectile(proj) {
-    this.players.forEach(p => {
-      if (p.id !== proj.ownerId) {
-        const ws = connections.get(p.id);
-        if (ws) send(ws, { type:'REMOTE_PROJECTILE', proj });
-      }
-    });
-  }
-
-  applyHit(fromId, toId, damage) {
-    const state = this.states[toId];
-    if (!state || !state.alive) return;
-    state.hp = Math.max(0, state.hp - damage);
-    if (state.hp <= 0) {
-      state.alive = false;
-      this.kills[fromId] = (this.kills[fromId]||0) + 1;
-      const tws = connections.get(toId);
-      if (tws) send(tws, { type:'REMOTE_KILLED', byId:fromId, byNick:this.states[fromId]?.nick||'???' });
-      const kws = connections.get(fromId);
-      if (kws) send(kws, { type:'REMOTE_KILL_CONFIRMED', targetId:toId, targetNick:state.nick });
-      this.broadcastAll({ type:'REMOTE_PLAYER_DIED', playerId:toId, nick:state.nick, killerNick:this.states[fromId]?.nick });
-    } else {
-      const tws = connections.get(toId);
-      if (tws) send(tws, { type:'REMOTE_DAMAGE', damage, fromId, newHp:state.hp });
-    }
-  }
-
-  broadcastState() {
-    if (this.finished) return;
-    const msg = { type:'ROOM_STATE', states:this.states, kills:this.kills, tick:this.tick++ };
-    this.players.forEach(p => { const ws=connections.get(p.id); if(ws) send(ws,msg); });
-  }
-
-  broadcastAll(msg) {
-    this.players.forEach(p => { const ws=connections.get(p.id); if(ws) send(ws,msg); });
-  }
-
-  finish() {
-    this.finished = true;
-    clearInterval(this.interval);
-    gameRooms.delete(this.id);
-  }
+function broadcast(ids, msg) {
+  ids.forEach(id => { const ws = conns.get(id); if (ws) send(ws, msg); });
 }
 
-function findRoomByPlayer(pid) {
-  for (const room of gameRooms.values()) {
-    if (room.players.find(p => p.id === pid)) return room;
-  }
-  return null;
+function genId() {
+  const c = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const p1 = Array.from({length:4}, () => c[Math.floor(Math.random()*c.length)]).join('');
+  const p2 = Array.from({length:4}, () => c[Math.floor(Math.random()*c.length)]).join('');
+  return `AJ-${p1}-${p2}`;
 }
-// ============================================================
-//  MATCHMAKING
-// ============================================================
-let currentQueue = null; // { id, players:[{id,nick,charIcon}], timer, startTime }
-
-function startMatchmaking(playerId, nick, charIcon) {
-  // Уже в очереди?
-  if (currentQueue && currentQueue.players.find(p => p.id === playerId)) return;
-
-  // Создать новую очередь если нет
-  if (!currentQueue) {
-    currentQueue = {
-      id: uuidv4().slice(0,8).toUpperCase(),
-      players: [],
-      startTime: Date.now(),
-      timeLimit: 10000 // 10 секунд
-    };
-    console.log('[MM] Новая очередь:', currentQueue.id);
-  }
-
-  // Добавить игрока
-  currentQueue.players.push({ id: playerId, nick, charIcon: charIcon||'🍎' });
-  console.log('[MM] Игрок добавлен:', nick, '| В очереди:', currentQueue.players.length);
-
-  // Оповестить всех в очереди
-  broadcastQueue();
-
-  // Запустить таймер если ещё не запущен
-  if (!currentQueue.timer) {
-    currentQueue.timer = setInterval(() => tickMatchmaking(), 1000);
-  }
-
-  // Если 10 игроков — запустить сразу
-  if (currentQueue.players.length >= 10) {
-    launchMatch();
-  }
-}
-
-function leaveMatchmaking(playerId) {
-  if (!currentQueue) return;
-  currentQueue.players = currentQueue.players.filter(p => p.id !== playerId);
-  if (currentQueue.players.length === 0) {
-    clearInterval(currentQueue.timer);
-    currentQueue = null;
-    return;
-  }
-  broadcastQueue();
-}
-
-function broadcastQueue() {
-  if (!currentQueue) return;
-  const elapsed = Date.now() - currentQueue.startTime;
-  const timeLeft = Math.max(0, Math.ceil((currentQueue.timeLimit - elapsed) / 1000));
-  currentQueue.players.forEach(p => {
-    const ws = connections.get(p.id);
-    if (ws) send(ws, {
-      type: 'QUEUE_UPDATE',
-      count: currentQueue.players.length,
-      max: 10,
-      found: currentQueue.players.length,
-      total: 10,
-      timeLeft,
-      players: currentQueue.players.map(x => ({ nick: x.nick, charIcon: x.charIcon }))
-    });
-  });
-}
-
-function tickMatchmaking() {
-  if (!currentQueue) return;
-  const elapsed = Date.now() - currentQueue.startTime;
-  const timeLeft = Math.max(0, Math.ceil((currentQueue.timeLimit - elapsed) / 1000));
-  broadcastQueue();
-  if (elapsed >= currentQueue.timeLimit) {
-    launchMatch();
-  }
-}
-
-function launchMatch() {
-  if (!currentQueue || currentQueue.players.length === 0) return;
-  clearInterval(currentQueue.timer);
-  const queue = currentQueue;
-  currentQueue = null;
-
-  console.log('[MM] Запуск матча! Игроков:', queue.players.length);
-
-  // Назначить команды
-  const teams = {};
-  queue.players.forEach((p, i) => { teams[p.id] = i % 2 === 0 ? 'A' : 'B'; });
-
-  // Создать игровую комнату
-  const playersInfo = queue.players.map(p => ({
-    id: p.id,
-    nickname: p.nick,
-    team: teams[p.id],
-    charIcon: p.charIcon
-  }));
-  const room = new GameRoom(queue.id, playersInfo);
-  gameRooms.set(queue.id, room);
-
-  // Запустить у всех
-  queue.players.forEach(p => {
-    const ws = connections.get(p.id);
-    if (ws) send(ws, {
-      type: 'LOBBY_KB_START',
-      isMatchmaking: true,
-      lobbyId: queue.id,
-      roomId: queue.id,
-      teams,
-      players: playersInfo,
-      myTeam: teams[p.id],
-      realPlayers: queue.players.length
-    });
-  });
-}
-
 
 // ============================================================
 //  REST API
 // ============================================================
 app.post('/api/auth', async (req, res) => {
   const { nickname, deviceToken } = req.body;
-  if (!nickname || nickname.trim().length < 2) return res.status(400).json({ error:'Слишком короткий ник' });
+  if (!nickname || nickname.trim().length < 2) {
+    return res.status(400).json({ error: 'Ник слишком короткий' });
+  }
 
-  // Найти по токену
   if (deviceToken) {
-    const existing = await getPlayerByToken(deviceToken);
-    if (existing) {
-      if (existing.nickname !== nickname.trim()) {
-        existing.nickname = nickname.trim().slice(0,25);
-        await savePlayer(existing);
+    const ex = await getPlayerByToken(deviceToken);
+    if (ex) {
+      if (ex.nickname !== nickname.trim()) {
+        ex.nickname = nickname.trim().slice(0, 25);
+        await savePlayer(ex);
       }
-      return res.json({ playerId:existing.id, nickname:existing.nickname, deviceToken:existing.deviceToken, isNew:false });
+      return res.json({ playerId: ex.id, nickname: ex.nickname, deviceToken: ex.deviceToken });
     }
   }
 
-  // Новый игрок
-  const playerId = generatePlayerId();
-  const newToken = deviceToken || uuidv4();
-  const player = {
-    id: playerId,
-    nickname: nickname.trim().slice(0,25),
-    deviceToken: newToken,
-    createdAt: Date.now(),
+  const id = genId();
+  const token = deviceToken || uuidv4();
+  const p = {
+    id, nickname: nickname.trim().slice(0, 25),
+    deviceToken: token, createdAt: Date.now(),
     friends: [], friendRequests: [], sentRequests: [],
-    stats: { wins:0, games:0 }
+    stats: { wins: 0, games: 0 }
   };
-  await savePlayer(player);
-  await redisSet(`token:${newToken}`, playerId);
-  res.json({ playerId, nickname:player.nickname, deviceToken:newToken, isNew:true });
+  await savePlayer(p);
+  await rSet('t:' + token, id);
+  res.json({ playerId: id, nickname: p.nickname, deviceToken: token });
 });
 
 app.get('/api/player/:id', async (req, res) => {
   const p = await getPlayer(req.params.id);
-  if (!p) return res.status(404).json({ error:'Не найден' });
-  res.json({ id:p.id, nickname:p.nickname, online:getOnlineStatus(p.id), stats:p.stats, friendsCount:(p.friends||[]).length });
+  if (!p) return res.status(404).json({ error: 'Не найден' });
+  res.json({ id: p.id, nickname: p.nickname, online: conns.has(p.id), stats: p.stats, friendsCount: (p.friends||[]).length });
 });
 
-app.get('/api/friends/:playerId', async (req, res) => {
-  const p = await getPlayer(req.params.playerId);
-  if (!p) return res.status(404).json({ error:'Не найден' });
-  const friends = await Promise.all((p.friends||[]).map(async fid => {
+app.get('/api/friends/:id', async (req, res) => {
+  const p = await getPlayer(req.params.id);
+  if (!p) return res.status(404).json({ error: 'Не найден' });
+
+  const friends = (await Promise.all((p.friends||[]).map(async fid => {
     const f = await getPlayer(fid);
-    if (!f) return null;
-    return {
-      id: f.id,
-      nickname: f.nickname || '???',
-      online: getOnlineStatus(fid),
-      stats: f.stats || {wins:0,games:0}
-    };
-  }));
-  const incoming = await Promise.all((p.friendRequests||[]).map(async fid => {
+    return f ? { id: f.id, nickname: f.nickname, online: conns.has(fid), stats: f.stats||{wins:0,games:0} } : null;
+  }))).filter(Boolean);
+
+  const incoming = (await Promise.all((p.friendRequests||[]).map(async fid => {
     const f = await getPlayer(fid);
-    if (!f) return null;
-    return { id:fid, nickname: f.nickname || '???' };
-  }));
-  res.json({ friends:friends.filter(Boolean), incoming:incoming.filter(Boolean) });
+    return f ? { id: fid, nickname: f.nickname } : null;
+  }))).filter(Boolean);
+
+  res.json({ friends, incoming });
 });
 
 app.get('/api/status', (req, res) => {
-  res.json({ online:connections.size, rooms:gameRooms.size, uptime:Math.floor(process.uptime()) });
+  res.json({
+    online: conns.size,
+    queue: queue ? queue.players.length : 0,
+    uptime: Math.floor(process.uptime())
+  });
 });
 
 app.get('*', (req, res) => {
-  const p1 = path.join(__dirname,'public','index.html');
-  const p2 = path.join(__dirname,'index.html');
+  const p1 = path.join(__dirname, 'public', 'index.html');
+  const p2 = path.join(__dirname, 'index.html');
   if (fs.existsSync(p1)) res.sendFile(p1);
   else if (fs.existsSync(p2)) res.sendFile(p2);
   else res.status(404).send('Not found');
@@ -438,370 +248,309 @@ app.get('*', (req, res) => {
 // ============================================================
 //  WEBSOCKET
 // ============================================================
-wss.on('connection', (ws) => {
-  ws.on('message', async (raw) => {
+wss.on('connection', ws => {
+  ws.on('message', async raw => {
     let msg;
     try { msg = JSON.parse(raw); } catch(e) { return; }
     const { type, playerId } = msg;
     const player = playerId ? await getPlayer(playerId) : null;
 
-    switch(type) {
+    switch (type) {
 
+      // ---- AUTH ----
       case 'CONNECT': {
-        if (!player) return send(ws,{type:'ERROR',text:'Игрок не найден. Перезагрузи страницу.'});
-        const old = connections.get(playerId);
-        if (old && old!==ws) old.close();
-        connections.set(playerId, ws);
-        wsToPlayer.set(ws, playerId);
-        send(ws,{type:'CONNECTED',playerId,nickname:player.nickname});
+        if (!player) return send(ws, { type: 'ERROR', text: 'Игрок не найден' });
+        const old = conns.get(playerId);
+        if (old && old !== ws) old.close();
+        conns.set(playerId, ws);
+        wsMap.set(ws, playerId);
+        send(ws, { type: 'CONNECTED', playerId, nickname: player.nickname });
+
         // Уведомить друзей
         for (const fid of (player.friends||[])) {
-          const fw = connections.get(fid);
-          if (fw) send(fw,{type:'FRIEND_ONLINE',friendId:playerId,nickname:player.nickname});
+          const fw = conns.get(fid);
+          if (fw) send(fw, { type: 'FRIEND_ONLINE', friendId: playerId, nickname: player.nickname });
         }
+
         // Входящие заявки
         if ((player.friendRequests||[]).length > 0) {
-          const reqs = await Promise.all(player.friendRequests.map(async fid => {
+          const reqs = (await Promise.all(player.friendRequests.map(async fid => {
             const f = await getPlayer(fid);
-            return f ? {id:fid,nickname:f.nickname} : null;
-          }));
-          const valid = reqs.filter(Boolean);
-          if (valid.length) send(ws,{type:'FRIEND_REQUESTS',requests:valid});
-        }
-        // Лобби
-        const lobbyId = playerLobbies.get(playerId);
-        if (lobbyId) {
-          const lobby = await getLobby(lobbyId);
-          if (lobby) send(ws,{type:'LOBBY_DATA',lobby:await buildLobbyData(lobby)});
-          else { send(ws,{type:'LOBBY_DATA',lobby:null}); playerLobbies.delete(playerId); }
-        } else {
-          send(ws,{type:'LOBBY_DATA',lobby:null});
+            return f ? { id: fid, nickname: f.nickname } : null;
+          }))).filter(Boolean);
+          if (reqs.length) send(ws, { type: 'FRIEND_REQUESTS', requests: reqs });
         }
         break;
       }
 
+      // ---- MATCHMAKING ----
+      case 'MM_JOIN': {
+        if (!player) return send(ws, { type: 'ERROR', text: 'Нет подключения' });
+        mmJoin(playerId, player.nickname, msg.charIcon);
+        break;
+      }
+
+      case 'MM_LEAVE': {
+        mmLeave(playerId);
+        send(ws, { type: 'MM_LEFT' });
+        break;
+      }
+
+      // ---- FRIENDS ----
       case 'FRIEND_REQUEST': {
         if (!player) return;
-        const { targetId } = msg;
-        const target = await getPlayer(targetId);
-        if (!target) return send(ws,{type:'ERROR',text:'Игрок с таким ID не найден'});
-        if (targetId===playerId) return send(ws,{type:'ERROR',text:'Нельзя добавить себя'});
-        if ((player.friends||[]).includes(targetId)) return send(ws,{type:'ERROR',text:'Уже в друзьях'});
-        if ((player.sentRequests||[]).includes(targetId)) return send(ws,{type:'ERROR',text:'Заявка уже отправлена'});
-        if (!player.sentRequests) player.sentRequests=[];
-        if (!target.friendRequests) target.friendRequests=[];
-        player.sentRequests.push(targetId);
+        const target = await getPlayer(msg.targetId);
+        if (!target) return send(ws, { type: 'ERROR', text: 'Игрок не найден' });
+        if (msg.targetId === playerId) return send(ws, { type: 'ERROR', text: 'Нельзя добавить себя' });
+        if ((player.friends||[]).includes(msg.targetId)) return send(ws, { type: 'ERROR', text: 'Уже в друзьях' });
+        if ((player.sentRequests||[]).includes(msg.targetId)) return send(ws, { type: 'ERROR', text: 'Заявка уже отправлена' });
+
+        if (!player.sentRequests) player.sentRequests = [];
+        if (!target.friendRequests) target.friendRequests = [];
+        player.sentRequests.push(msg.targetId);
         target.friendRequests.push(playerId);
         await savePlayer(player);
         await savePlayer(target);
-        send(ws,{type:'FRIEND_REQUEST_SENT',targetId,targetNick:target.nickname});
-        const tw = connections.get(targetId);
-        if (tw) send(tw,{type:'FRIEND_REQUEST_IN',fromId:playerId,fromNick:player.nickname});
+
+        send(ws, { type: 'FRIEND_REQUEST_SENT', targetId: msg.targetId, targetNick: target.nickname });
+        const tw = conns.get(msg.targetId);
+        if (tw) send(tw, { type: 'FRIEND_REQUEST_IN', fromId: playerId, fromNick: player.nickname });
         break;
       }
 
       case 'FRIEND_ACCEPT': {
         if (!player) return;
-        const { fromId } = msg;
-        const from = await getPlayer(fromId);
+        const from = await getPlayer(msg.fromId);
         if (!from) return;
-        player.friendRequests=(player.friendRequests||[]).filter(id=>id!==fromId);
-        from.sentRequests=(from.sentRequests||[]).filter(id=>id!==playerId);
-        if (!player.friends) player.friends=[];
-        if (!from.friends) from.friends=[];
-        if (!player.friends.includes(fromId)) player.friends.push(fromId);
+
+        player.friendRequests = (player.friendRequests||[]).filter(id => id !== msg.fromId);
+        from.sentRequests = (from.sentRequests||[]).filter(id => id !== playerId);
+        if (!player.friends) player.friends = [];
+        if (!from.friends) from.friends = [];
+        if (!player.friends.includes(msg.fromId)) player.friends.push(msg.fromId);
         if (!from.friends.includes(playerId)) from.friends.push(playerId);
         await savePlayer(player);
         await savePlayer(from);
-        send(ws,{type:'FRIEND_ADDED',friend:{id:fromId,nickname:from.nickname||'???',online:getOnlineStatus(fromId),stats:from.stats||{wins:0,games:0}}});
-        const fw=connections.get(fromId);
-        if(fw) send(fw,{type:'FRIEND_ADDED',friend:{id:playerId,nickname:player.nickname||'???',online:true,stats:player.stats||{wins:0,games:0}}});
+
+        send(ws, { type: 'FRIEND_ADDED', friend: { id: msg.fromId, nickname: from.nickname, online: conns.has(msg.fromId) } });
+        const fw = conns.get(msg.fromId);
+        if (fw) send(fw, { type: 'FRIEND_ADDED', friend: { id: playerId, nickname: player.nickname, online: true } });
         break;
       }
 
       case 'FRIEND_DECLINE': {
         if (!player) return;
-        const { fromId } = msg;
-        const from = await getPlayer(fromId);
-        player.friendRequests=(player.friendRequests||[]).filter(id=>id!==fromId);
-        if(from){ from.sentRequests=(from.sentRequests||[]).filter(id=>id!==playerId); await savePlayer(from); }
+        const from = await getPlayer(msg.fromId);
+        player.friendRequests = (player.friendRequests||[]).filter(id => id !== msg.fromId);
+        if (from) { from.sentRequests = (from.sentRequests||[]).filter(id => id !== playerId); await savePlayer(from); }
         await savePlayer(player);
-        send(ws,{type:'FRIEND_DECLINED',fromId});
+        send(ws, { type: 'FRIEND_DECLINED', fromId: msg.fromId });
         break;
       }
 
+      // ---- LOBBY ----
       case 'LOBBY_CREATE': {
         if (!player) return;
-        const oldLobbyId = playerLobbies.get(playerId);
-        if (oldLobbyId) {
-          const oldLobby = await getLobby(oldLobbyId);
-          if (oldLobby) {
-            oldLobby.players=oldLobby.players.filter(id=>id!==playerId);
-            if (!oldLobby.players.length) await delLobby(oldLobbyId);
-            else await saveLobby(oldLobby);
+        const oldId = playerLobby.get(playerId);
+        if (oldId) {
+          const old = await rGet('lobby:' + oldId);
+          if (old) {
+            old.players = old.players.filter(id => id !== playerId);
+            if (!old.players.length) await rDel('lobby:' + oldId);
+            else await rSet('lobby:' + oldId, old);
           }
-          playerLobbies.delete(playerId);
         }
         const lid = uuidv4().slice(0,8).toUpperCase();
-        const lobby = { id:lid, host:playerId, players:[playerId], maxPlayers:4, status:'waiting', createdAt:Date.now() };
-        await saveLobby(lobby);
-        playerLobbies.set(playerId, lid);
-        send(ws,{type:'LOBBY_CREATED',lobbyId:lid,lobby:await buildLobbyData(lobby)});
+        const lobby = { id: lid, host: playerId, players: [playerId], maxPlayers: 4, status: 'waiting', createdAt: Date.now() };
+        await rSet('lobby:' + lid, lobby);
+        playerLobby.set(playerId, lid);
+        send(ws, { type: 'LOBBY_CREATED', lobbyId: lid, lobby: await buildLobby(lobby) });
         break;
       }
 
       case 'LOBBY_INVITE': {
         if (!player) return;
-        const { friendId } = msg;
-        const lobbyId = playerLobbies.get(playerId);
-        if (!lobbyId) return send(ws,{type:'ERROR',text:'Сначала создай лобби'});
-        const lobby = await getLobby(lobbyId);
-        if (!lobby) return send(ws,{type:'ERROR',text:'Лобби не найдено'});
-        if (lobby.players.length>=lobby.maxPlayers) return send(ws,{type:'ERROR',text:'Лобби заполнено (макс. 4)'});
-        // Проверяем друга (или разрешаем всем онлайн игрокам)
-        const fw=connections.get(friendId);
-        const fr=await getPlayer(friendId);
-        if(!fr) return send(ws,{type:'ERROR',text:'Игрок не найден'});
-        if(!fw) return send(ws,{type:'ERROR',text:'Друг не в сети'});
-        send(fw,{type:'LOBBY_INVITE_IN',lobbyId:lobby.id,hostId:playerId,hostNick:player.nickname||'???'});
-        send(ws,{type:'LOBBY_INVITE_SENT',friendId,friendNick:fr.nickname||'???'});
+        const lobbyId = playerLobby.get(playerId);
+        if (!lobbyId) return send(ws, { type: 'ERROR', text: 'Сначала создай лобби' });
+        const lobby = await rGet('lobby:' + lobbyId);
+        if (!lobby) return send(ws, { type: 'ERROR', text: 'Лобби не найдено' });
+        if (lobby.players.length >= 4) return send(ws, { type: 'ERROR', text: 'Лобби заполнено' });
+        const fr = await getPlayer(msg.friendId);
+        const fw = conns.get(msg.friendId);
+        if (!fr || !fw) return send(ws, { type: 'ERROR', text: 'Друг не в сети' });
+        send(fw, { type: 'LOBBY_INVITE_IN', lobbyId: lobby.id, hostId: playerId, hostNick: player.nickname });
+        send(ws, { type: 'LOBBY_INVITE_SENT', friendId: msg.friendId, friendNick: fr.nickname });
         break;
       }
 
       case 'LOBBY_JOIN': {
         if (!player) return;
-        const { lobbyId } = msg;
-        const lobby = await getLobby(lobbyId);
-        if (!lobby) return send(ws,{type:'ERROR',text:'Лобби не найдено'});
-        if (lobby.players.length>=lobby.maxPlayers) return send(ws,{type:'ERROR',text:'Лобби заполнено'});
-        if (lobby.status!=='waiting') return send(ws,{type:'ERROR',text:'Игра уже началась'});
-        // Покинуть старое лобби
-        const oldId=playerLobbies.get(playerId);
-        if (oldId&&oldId!==lobbyId) {
-          const old=await getLobby(oldId);
-          if(old){ old.players=old.players.filter(id=>id!==playerId); if(!old.players.length) await delLobby(oldId); else await saveLobby(old); broadcast(old.players,{type:'LOBBY_UPDATED',lobby:old}); }
-          playerLobbies.delete(playerId);
-        }
+        const lobby = await rGet('lobby:' + msg.lobbyId);
+        if (!lobby) return send(ws, { type: 'ERROR', text: 'Лобби не найдено' });
+        if (lobby.players.length >= 4) return send(ws, { type: 'ERROR', text: 'Лобби заполнено' });
         if (!lobby.players.includes(playerId)) lobby.players.push(playerId);
-        await saveLobby(lobby);
-        playerLobbies.set(playerId, lobbyId);
-        broadcast(lobby.players,{type:'LOBBY_UPDATED',lobby:await buildLobbyData(lobby)});
+        await rSet('lobby:' + msg.lobbyId, lobby);
+        playerLobby.set(playerId, msg.lobbyId);
+        broadcast(lobby.players, { type: 'LOBBY_UPDATED', lobby: await buildLobby(lobby) });
         break;
       }
 
       case 'LOBBY_DECLINE': {
-        const { lobbyId } = msg;
-        const lobby=await getLobby(lobbyId);
-        if(lobby){ const hw=connections.get(lobby.host); if(hw) send(hw,{type:'LOBBY_INVITE_DECLINED',byId:playerId,byNick:player?.nickname}); }
+        const lobby = await rGet('lobby:' + msg.lobbyId);
+        if (lobby) {
+          const hw = conns.get(lobby.host);
+          if (hw) send(hw, { type: 'LOBBY_INVITE_DECLINED', byNick: player?.nickname });
+        }
         break;
       }
 
       case 'LOBBY_LEAVE': {
         if (!player) return;
-        const lobbyId=playerLobbies.get(playerId);
+        const lobbyId = playerLobby.get(playerId);
         if (!lobbyId) return;
-        const lobby=await getLobby(lobbyId);
-        if (!lobby) { playerLobbies.delete(playerId); return; }
-        lobby.players=lobby.players.filter(id=>id!==playerId);
-        playerLobbies.delete(playerId);
-        if (!lobby.players.length) { await delLobby(lobbyId); }
-        else { if(lobby.host===playerId) lobby.host=lobby.players[0]; await saveLobby(lobby); broadcast(lobby.players,{type:'LOBBY_UPDATED',lobby:await buildLobbyData(lobby)}); }
-        send(ws,{type:'LOBBY_LEFT'});
+        const lobby = await rGet('lobby:' + lobbyId);
+        playerLobby.delete(playerId);
+        if (!lobby) return;
+        lobby.players = lobby.players.filter(id => id !== playerId);
+        if (!lobby.players.length) { await rDel('lobby:' + lobbyId); }
+        else {
+          if (lobby.host === playerId) lobby.host = lobby.players[0];
+          await rSet('lobby:' + lobbyId, lobby);
+          broadcast(lobby.players, { type: 'LOBBY_UPDATED', lobby: await buildLobby(lobby) });
+        }
+        send(ws, { type: 'LOBBY_LEFT' });
         break;
       }
 
       case 'LOBBY_GET': {
-        const lobbyId=playerLobbies.get(playerId);
+        const lobbyId = playerLobby.get(playerId);
         if (lobbyId) {
-          const lobby=await getLobby(lobbyId);
-          send(ws,{type:'LOBBY_DATA',lobby:lobby?await buildLobbyData(lobby):null});
+          const lobby = await rGet('lobby:' + lobbyId);
+          send(ws, { type: 'LOBBY_DATA', lobby: lobby ? await buildLobby(lobby) : null });
         } else {
-          send(ws,{type:'LOBBY_DATA',lobby:null});
+          send(ws, { type: 'LOBBY_DATA', lobby: null });
         }
-        break;
-      }
-
-      // ============================================================
-      //  MATCHMAKING
-      // ============================================================
-      case 'QUEUE_JOIN': {
-        if (!player) return;
-        // Убрать из очереди если уже есть
-        matchQueue = matchQueue.filter(p => p.playerId !== playerId);
-        // Добавить в очередь
-        matchQueue.push({
-          playerId,
-          nick: player.nickname || '???',
-          charIcon: msg.charIcon || '🍎',
-          joinedAt: Date.now()
-        });
-        console.log('[Queue] Игрок добавлен:', player.nickname, 'В очереди:', matchQueue.length);
-        send(ws, { type: 'QUEUE_JOINED', count: matchQueue.length, max: MATCH_SIZE });
-        broadcastQueueUpdate();
-        // Если набралось MATCH_SIZE — запустить сразу
-        if (matchQueue.length >= MATCH_SIZE) {
-          launchMatch();
-        } else {
-          startMatchTimer();
-        }
-        break;
-      }
-
-      case 'QUEUE_LEAVE': {
-        matchQueue = matchQueue.filter(p => p.playerId !== playerId);
-        send(ws, { type: 'QUEUE_LEFT' });
-        broadcastQueueUpdate();
-        if (matchQueue.length === 0) { clearTimeout(matchTimer); matchTimer = null; }
         break;
       }
 
       case 'LOBBY_START_KB': {
         if (!player) return;
-        const lobbyId=playerLobbies.get(playerId);
-        if (!lobbyId) return send(ws,{type:'ERROR',text:'Нет лобби'});
-        const lobby=await getLobby(lobbyId);
-        if (!lobby) return send(ws,{type:'ERROR',text:'Лобби не найдено'});
-        if (lobby.host!==playerId) return send(ws,{type:'ERROR',text:'Только хост может начать'});
-        lobby.status='kb';
-        await saveLobby(lobby);
-        const teams={};
-        lobby.players.forEach((pid,i)=>{ teams[pid]=i%2===0?'A':'B'; });
+        const lobbyId = playerLobby.get(playerId);
+        if (!lobbyId) return send(ws, { type: 'ERROR', text: 'Нет лобби' });
+        const lobby = await rGet('lobby:' + lobbyId);
+        if (!lobby) return send(ws, { type: 'ERROR', text: 'Лобби не найдено' });
+        if (lobby.host !== playerId) return send(ws, { type: 'ERROR', text: 'Только хост' });
+
+        const teams = {};
+        lobby.players.forEach((pid, i) => { teams[pid] = i % 2 === 0 ? 'A' : 'B'; });
         const playersInfo = await Promise.all(lobby.players.map(async pid => ({
           id: pid,
-          nickname: (await getPlayer(pid))?.nickname||'???',
+          nickname: (await getPlayer(pid))?.nickname || '???',
           team: teams[pid],
-          charIcon: msg.playerIcons?.[pid]||'🍎'
+          charIcon: msg.playerIcons?.[pid] || '🍎'
         })));
-        const room = new GameRoom(lobby.id, playersInfo);
-        gameRooms.set(lobby.id, room);
-        broadcast(lobby.players,{type:'LOBBY_KB_START',lobbyId:lobby.id,roomId:lobby.id,teams,players:playersInfo});
-        break;
-      }
 
-      case 'MM_JOIN':
-      case 'QUEUE_JOIN': {
-        if (!player) return send(ws, {type:'ERROR', text:'Сначала войди в игру'});
-        startMatchmaking(playerId, player.nickname||'???', msg.charIcon||'🍎');
-        break;
-      }
-
-      case 'MM_LEAVE':
-      case 'QUEUE_LEAVE': {
-        leaveMatchmaking(playerId);
-        send(ws, {type:'MM_LEFT'});
-        break;
-      }
-
-      case 'GAME_STATE': {
-        const room=findRoomByPlayer(playerId);
-        if(room) room.updateState(playerId,{x:msg.x,y:msg.y,hp:msg.hp,maxHp:msg.maxHp,alive:msg.alive,charIcon:msg.charIcon,nick:player?.nickname,superCharge:msg.superCharge,emojiId:msg.emojiId});
-        break;
-      }
-
-      case 'GAME_PROJECTILE': {
-        const room=findRoomByPlayer(playerId);
-        if(room) room.addProjectile({...msg.proj,ownerId:playerId,ownerNick:player?.nickname});
-        break;
-      }
-
-      case 'GAME_HIT': {
-        const room=findRoomByPlayer(playerId);
-        if(room) room.applyHit(playerId,msg.targetId,msg.damage);
-        break;
-      }
-
-      case 'KB_RESULT': {
-        if (!player) return;
-        player.stats=player.stats||{wins:0,games:0};
-        player.stats.games++;
-        if(msg.won) player.stats.wins++;
-        await savePlayer(player);
-        const lobbyId=playerLobbies.get(playerId);
-        if(lobbyId){ const lobby=await getLobby(lobbyId); if(lobby){ lobby.status='waiting'; await saveLobby(lobby); broadcast(lobby.players,{type:'LOBBY_UPDATED',lobby:await buildLobbyData(lobby)}); } }
+        lobby.status = 'kb';
+        await rSet('lobby:' + lobbyId, lobby);
+        broadcast(lobby.players, { type: 'LOBBY_KB_START', lobbyId, roomId: lobbyId, teams, players: playersInfo });
         break;
       }
 
       case 'LOBBY_CHAT': {
         if (!player) return;
-        const lobbyId=playerLobbies.get(playerId);
+        const lobbyId = playerLobby.get(playerId);
         if (!lobbyId) return;
-        const lobby=await getLobby(lobbyId);
+        const lobby = await rGet('lobby:' + lobbyId);
         if (!lobby) return;
-        const text=(msg.text||'').trim().slice(0,100);
-        if(!text) return;
-        broadcast(lobby.players,{type:'LOBBY_CHAT_MSG',fromId:playerId,fromNick:player.nickname,text});
+        const text = (msg.text||'').trim().slice(0,100);
+        if (!text) return;
+        broadcast(lobby.players, { type: 'LOBBY_CHAT_MSG', fromId: playerId, fromNick: player.nickname, text });
         break;
       }
 
+      // ---- GIFTS ----
       case 'SEND_GIFT': {
         if (!player) return;
-        const tw=connections.get(msg.targetId);
-        const target=await getPlayer(msg.targetId);
-        if(!tw||!target) return send(ws,{type:'ERROR',text:'Игрок не в сети'});
-        const desc=msg.giftType==='money'?`${msg.amount} F-Bucks`:`${msg.amount} кристаллов`;
-        send(tw,{type:'GIFT_RECEIVED',fromId:playerId,fromNick:player.nickname,giftType:msg.giftType,amount:msg.amount,[msg.giftType]:msg.amount,desc});
+        const tw = conns.get(msg.targetId);
+        const target = await getPlayer(msg.targetId);
+        if (!tw || !target) return send(ws, { type: 'ERROR', text: 'Игрок не в сети' });
+        const desc = msg.giftType === 'money' ? `${msg.amount} F-Bucks` : `${msg.amount} кристаллов`;
+        send(tw, { type: 'GIFT_RECEIVED', fromId: playerId, fromNick: player.nickname, giftType: msg.giftType, amount: msg.amount, [msg.giftType]: msg.amount, desc });
         break;
       }
 
+      // ---- TRADE ----
       case 'TRADE_OFFER': {
         if (!player) return;
-        const tw=connections.get(msg.targetId);
-        if(!tw) return send(ws,{type:'ERROR',text:'Игрок не в сети'});
-        send(tw,{type:'TRADE_REQUEST',fromId:playerId,fromNick:player.nickname,offer:msg.offer});
+        const tw = conns.get(msg.targetId);
+        if (!tw) return send(ws, { type: 'ERROR', text: 'Не в сети' });
+        send(tw, { type: 'TRADE_REQUEST', fromId: playerId, fromNick: player.nickname, offer: msg.offer });
         break;
       }
-
       case 'TRADE_ACCEPT': {
         if (!player) return;
-        const fw=connections.get(msg.fromId);
-        if(fw) send(fw,{type:'TRADE_ACCEPTED',byId:playerId,byNick:player.nickname});
+        const fw = conns.get(msg.fromId);
+        if (fw) send(fw, { type: 'TRADE_ACCEPTED', byNick: player.nickname });
         break;
       }
-
       case 'TRADE_DECLINE': {
         if (!player) return;
-        const fw=connections.get(msg.fromId);
-        if(fw) send(fw,{type:'TRADE_DECLINED',byId:playerId,byNick:player.nickname});
+        const fw = conns.get(msg.fromId);
+        if (fw) send(fw, { type: 'TRADE_DECLINED', byNick: player.nickname });
         break;
       }
 
-      case 'CLICKBATTLE_CHALLENGE': {
+      // ---- CLICK BATTLE ----
+      case 'CB_CHALLENGE': {
         if (!player) return;
-        const tw=connections.get(msg.targetId);
-        if(!tw) return send(ws,{type:'ERROR',text:'Друг не в сети'});
-        send(tw,{type:'CLICKBATTLE_INVITE',fromId:playerId,fromNick:player.nickname});
+        const tw = conns.get(msg.targetId);
+        if (!tw) return send(ws, { type: 'ERROR', text: 'Друг не в сети' });
+        send(tw, { type: 'CB_INVITE', fromId: playerId, fromNick: player.nickname });
+        break;
+      }
+      case 'CB_ACCEPT': {
+        if (!player) return;
+        const fw = conns.get(msg.targetId);
+        if (!fw) return;
+        ws._cbOpp = msg.targetId;
+        fw._cbOpp = playerId;
+        ws._cbScore = 0;
+        fw._cbScore = 0;
+        const oppNick = (await getPlayer(msg.targetId))?.nickname || '???';
+        send(ws, { type: 'CB_START', oppNick, oppId: msg.targetId });
+        send(fw, { type: 'CB_START', oppNick: player.nickname, oppId: playerId });
+        break;
+      }
+      case 'CB_CLICK': {
+        ws._cbScore = msg.score || 0;
+        const tid = ws._cbOpp;
+        if (tid) { const tw = conns.get(tid); if (tw) send(tw, { type: 'CB_UPDATE', oppScore: ws._cbScore }); }
+        break;
+      }
+      case 'CB_DONE': {
+        const tid = ws._cbOpp;
+        if (!tid) break;
+        const tw = conns.get(tid);
+        const myScore = msg.score || 0;
+        const oppScore = tw ? (tw._cbScore || 0) : 0;
+        const winnerId = myScore >= oppScore ? playerId : tid;
+        send(ws, { type: 'CB_END', winnerId, myScore, oppScore });
+        if (tw) send(tw, { type: 'CB_END', winnerId, myScore: oppScore, oppScore: myScore });
+        ws._cbOpp = null;
+        if (tw) tw._cbOpp = null;
         break;
       }
 
-      case 'CLICKBATTLE_ACCEPT': {
+      case 'KB_RESULT': {
         if (!player) return;
-        const fw=connections.get(msg.targetId);
-        if(!fw) return;
-        ws._cbOpponent=msg.targetId;
-        fw._cbOpponent=playerId;
-        send(ws,{type:'CLICKBATTLE_START',oppNick:(await getPlayer(msg.targetId))?.nickname||'?',oppId:msg.targetId});
-        send(fw,{type:'CLICKBATTLE_START',oppNick:player.nickname,oppId:playerId});
-        break;
-      }
-
-      case 'CLICKBATTLE_CLICK': {
-        if (!player) return;
-        const tid=ws._cbOpponent;
-        if(tid){ const tw=connections.get(tid); if(tw) send(tw,{type:'CLICKBATTLE_UPDATE',oppScore:msg.score}); }
-        ws._cbScore=msg.score;
-        break;
-      }
-
-      case 'CLICKBATTLE_DONE': {
-        if (!player) return;
-        const tid=ws._cbOpponent;
-        if(tid){
-          const tw=connections.get(tid);
-          const myScore=msg.score;
-          const oppScore = tw ? (tw._cbScore || 0) : 0;
-          const winnerId=myScore>=oppScore?playerId:tid;
-          send(ws,{type:'CLICKBATTLE_END',winnerId,myScore,oppScore});
-          if(tw) send(tw,{type:'CLICKBATTLE_END',winnerId,myScore:oppScore,oppScore:myScore});
+        player.stats = player.stats || { wins: 0, games: 0 };
+        player.stats.games++;
+        if (msg.won) player.stats.wins++;
+        await savePlayer(player);
+        const lobbyId = playerLobby.get(playerId);
+        if (lobbyId) {
+          const lobby = await rGet('lobby:' + lobbyId);
+          if (lobby) { lobby.status = 'waiting'; await rSet('lobby:' + lobbyId, lobby); broadcast(lobby.players, { type: 'LOBBY_UPDATED', lobby: await buildLobby(lobby) }); }
         }
         break;
       }
@@ -809,32 +558,38 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', async () => {
-    const playerId=wsToPlayer.get(ws);
-    if(!playerId) return;
-    connections.delete(playerId);
-    wsToPlayer.delete(ws);
-    const player=await getPlayer(playerId);
-    if(player) for(const fid of (player.friends||[])){ const fw=connections.get(fid); if(fw) send(fw,{type:'FRIEND_OFFLINE',friendId:playerId}); }
-    // Remove from matchmaking queue
-    matchQueue = matchQueue.filter(p => p.playerId !== playerId);
-    broadcastQueueUpdate();
-    const lobbyId=playerLobbies.get(playerId);
-    if(lobbyId){
-      const lobby=await getLobby(lobbyId);
-      if(lobby){
-        lobby.players=lobby.players.filter(id=>id!==playerId);
-        playerLobbies.delete(playerId);
-        if(!lobby.players.length){ await delLobby(lobbyId); }
-        else { if(lobby.host===playerId) lobby.host=lobby.players[0]; await saveLobby(lobby); broadcast(lobby.players,{type:'LOBBY_UPDATED',lobby:await buildLobbyData(lobby)}); }
+    const playerId = wsMap.get(ws);
+    if (!playerId) return;
+    conns.delete(playerId);
+    wsMap.delete(ws);
+    mmLeave(playerId);
+
+    const player = await getPlayer(playerId);
+    if (player) {
+      for (const fid of (player.friends||[])) {
+        const fw = conns.get(fid);
+        if (fw) send(fw, { type: 'FRIEND_OFFLINE', friendId: playerId });
       }
     }
-    leaveMatchmaking(playerId);
-    const room=findRoomByPlayer(playerId);
-    if(room){ const state=room.states[playerId]; if(state){ state.alive=false; room.broadcastAll({type:'REMOTE_PLAYER_DIED',playerId,nick:player?.nickname,killerNick:'disconnect'}); } }
+
+    const lobbyId = playerLobby.get(playerId);
+    if (lobbyId) {
+      const lobby = await rGet('lobby:' + lobbyId);
+      playerLobby.delete(playerId);
+      if (lobby) {
+        lobby.players = lobby.players.filter(id => id !== playerId);
+        if (!lobby.players.length) { await rDel('lobby:' + lobbyId); }
+        else {
+          if (lobby.host === playerId) lobby.host = lobby.players[0];
+          await rSet('lobby:' + lobbyId, lobby);
+          broadcast(lobby.players, { type: 'LOBBY_UPDATED', lobby: await buildLobby(lobby) });
+        }
+      }
+    }
   });
 });
 
-async function buildLobbyData(lobby) {
+async function buildLobby(lobby) {
   const names = {};
   for (const pid of lobby.players) {
     const p = await getPlayer(pid);
@@ -845,5 +600,5 @@ async function buildLobbyData(lobby) {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`🎮 Apple Journey Server запущен на порту ${PORT}`);
+  console.log('🎮 Apple Journey Server запущен на порту ' + PORT);
 });
