@@ -4008,7 +4008,19 @@
                             <span>⚡ Кнопка атаки — атака</span>
                             <span>🤝 Иногда боты объединяются!</span>
                         </div>
-                        <button class="br-start-btn" id="br-start-btn">▶ НАЧАТЬ БОЙ</button>
+                        <!-- MATCHMAKING UI -->
+                        <div id="br-matchmaking-ui">
+                          <button class="br-start-btn" id="br-start-btn" onclick="brStartMatchmaking()">▶ НАЙТИ БОЙ</button>
+                          <div id="br-queue-status" style="display:none;margin-top:12px;text-align:center;">
+                            <div style="font-family:'Share Tech Mono',monospace;font-size:14px;color:#FFD700;letter-spacing:2px;margin-bottom:8px;">ПОИСК ИГРОКОВ...</div>
+                            <div id="br-queue-count" style="font-family:'Share Tech Mono',monospace;font-size:28px;color:#00ff41;font-weight:bold;">0 / 10</div>
+                            <div id="br-queue-timer" style="font-family:'Share Tech Mono',monospace;font-size:13px;color:#888;margin-top:4px;">Запуск через: 10 сек</div>
+                            <div style="margin-top:8px;height:4px;background:rgba(255,255,255,0.1);border-radius:2px;overflow:hidden;max-width:300px;margin-left:auto;margin-right:auto;">
+                              <div id="br-queue-bar" style="height:100%;background:linear-gradient(90deg,#00ff41,#FFD700);width:0%;transition:width 0.3s;"></div>
+                            </div>
+                            <button onclick="brCancelMatchmaking()" style="margin-top:12px;background:rgba(40,0,0,0.8);border:1px solid rgba(255,60,60,0.5);color:#ff6666;border-radius:6px;padding:6px 16px;cursor:pointer;font-family:'Share Tech Mono',monospace;font-size:12px;">✖ ОТМЕНА</button>
+                          </div>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -12481,6 +12493,162 @@
     </div>
 
 <script src="/multiplayer.js"></script>
+<script>
+// ================================================================
+//  MATCHMAKING CLIENT
+// ================================================================
+var _mmTimer = null;
+var _mmSeconds = 10;
+var _mmActive = false;
+
+function brStartMatchmaking() {
+  if (_mmActive) return;
+
+  // Проверяем подключение к серверу
+  if (typeof AJ_SERVER === 'undefined' || !AJ_SERVER.playerId) {
+    // Если нет подключения — просто запускаем локально как раньше
+    var btn = document.getElementById('br-start-btn');
+    if (btn) { btn.style.display = 'none'; }
+    document.getElementById('br-queue-status').style.display = 'block';
+    document.getElementById('br-queue-count').textContent = '1 / 10';
+    _mmSeconds = 10;
+    _mmActive = true;
+    _mmTimer = setInterval(function() {
+      _mmSeconds--;
+      var timerEl = document.getElementById('br-queue-timer');
+      var barEl = document.getElementById('br-queue-bar');
+      if (timerEl) timerEl.textContent = 'Запуск через: ' + _mmSeconds + ' сек';
+      if (barEl) barEl.style.width = ((10 - _mmSeconds) / 10 * 100) + '%';
+      if (_mmSeconds <= 0) {
+        clearInterval(_mmTimer);
+        _mmActive = false;
+        brLaunchGame([]);
+      }
+    }, 1000);
+    return;
+  }
+
+  // Есть подключение — используем сервер
+  _mmActive = true;
+  _mmSeconds = 10;
+  var btn = document.getElementById('br-start-btn');
+  if (btn) btn.style.display = 'none';
+  document.getElementById('br-queue-status').style.display = 'block';
+
+  var charIcon = '🍎';
+  try {
+    var charId = window.gameData && window.gameData.selectedCharacterId;
+    if (charId) {
+      var ch = window.gameData.characters.find(function(c){ return c.id === charId; });
+      if (ch && ch.icon && !ch.icon.startsWith('<') && !ch.icon.startsWith('http')) charIcon = ch.icon;
+    }
+  } catch(e) {}
+
+  AJ_SERVER.send({ type: 'QUEUE_JOIN', charIcon: charIcon });
+
+  _mmTimer = setInterval(function() {
+    _mmSeconds--;
+    var timerEl = document.getElementById('br-queue-timer');
+    if (timerEl) timerEl.textContent = 'Запуск через: ' + _mmSeconds + ' сек';
+    if (_mmSeconds <= 0) clearInterval(_mmTimer);
+  }, 1000);
+}
+
+function brCancelMatchmaking() {
+  _mmActive = false;
+  clearInterval(_mmTimer);
+  if (typeof AJ_SERVER !== 'undefined' && AJ_SERVER.playerId) {
+    AJ_SERVER.send({ type: 'QUEUE_LEAVE' });
+  }
+  var btn = document.getElementById('br-start-btn');
+  if (btn) btn.style.display = 'block';
+  document.getElementById('br-queue-status').style.display = 'none';
+  _mmSeconds = 10;
+  var bar = document.getElementById('br-queue-bar');
+  if (bar) bar.style.width = '0%';
+}
+
+function brLaunchGame(remotePlayers) {
+  brCancelMatchmaking();
+  // Запускаем КБ
+  var startBtn = document.getElementById('br-start-btn');
+  if (typeof initBattleRoyale === 'function') {
+    var lobbyEl = document.getElementById('br-lobby');
+    if (lobbyEl) lobbyEl.style.display = 'none';
+    initBattleRoyale();
+  }
+}
+
+// Обработка обновлений очереди от сервера
+if (typeof window !== 'undefined') {
+  window.addEventListener('load', function() {
+    setTimeout(function() {
+      if (typeof AJ_SERVER === 'undefined') return;
+
+      var origHandle = AJ_SERVER._handle.bind(AJ_SERVER);
+      var patchedHandle = function(msg) {
+        if (msg.type === 'QUEUE_JOINED' || msg.type === 'QUEUE_UPDATE') {
+          var countEl = document.getElementById('br-queue-count');
+          var barEl = document.getElementById('br-queue-bar');
+          if (countEl) countEl.textContent = (msg.count || 1) + ' / ' + (msg.max || 10);
+          if (barEl) barEl.style.width = Math.min(100, ((msg.count || 1) / (msg.max || 10)) * 100) + '%';
+          return;
+        }
+        if (msg.type === 'QUEUE_LEFT') {
+          brCancelMatchmaking();
+          return;
+        }
+        if (msg.type === 'LOBBY_KB_START' && msg.isMatchmaking) {
+          // Матч найден! Запускаем
+          _mmActive = false;
+          clearInterval(_mmTimer);
+          document.getElementById('br-queue-status').style.display = 'none';
+          var btn = document.getElementById('br-start-btn');
+          if (btn) btn.style.display = 'block';
+
+          var myTeam = msg.teams && msg.teams[AJ_SERVER.playerId];
+          var others = (msg.players || []).filter(function(p){ return p.id !== AJ_SERVER.playerId; });
+
+          showNotification('⚔️ МАТЧ НАЙДЕН! Команда ' + (myTeam||'?'),
+            'Игроков: ' + (msg.players||[]).length, 'unlock');
+
+          // Баннер с отсчётом
+          var banner = document.createElement('div');
+          banner.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,0.97);border:3px solid ' + (myTeam==='A'?'#00ff41':'#ff4444') + ';border-radius:18px;padding:24px 36px;z-index:99999;text-align:center;font-family:Share Tech Mono,monospace;min-width:260px;';
+          banner.innerHTML = '<div style="font-size:13px;color:#888;margin-bottom:6px;">МАТЧ НАЙДЕН!</div>' +
+            '<div style="font-size:28px;color:' + (myTeam==='A'?'#00ff41':'#ff4444') + ';letter-spacing:3px;margin-bottom:8px;">КОМАНДА ' + (myTeam||'?') + '</div>' +
+            '<div style="font-size:12px;color:#888;margin-bottom:4px;">Игроков в матче: ' + (msg.players||[]).length + '</div>' +
+            '<div id="mm-countdown" style="font-size:48px;color:#FFD700;margin-top:10px;">3</div>';
+          document.body.appendChild(banner);
+
+          var count = 3;
+          var tick = setInterval(function() {
+            count--;
+            var el = document.getElementById('mm-countdown');
+            if (el) el.textContent = count > 0 ? count : '⚔️';
+            if (count <= 0) {
+              clearInterval(tick);
+              setTimeout(function() {
+                banner.remove();
+                // Запускаем КБ
+                var lobbyEl = document.getElementById('br-lobby');
+                if (lobbyEl) lobbyEl.style.display = 'none';
+                if (typeof initBattleRoyale === 'function') initBattleRoyale();
+                // Инициализируем мультиплеер
+                if (typeof BRMultiplayer !== 'undefined') BRMultiplayer.init(msg);
+              }, 500);
+            }
+          }, 1000);
+          return;
+        }
+        origHandle(msg);
+      };
+
+      AJ_SERVER._handle = patchedHandle;
+    }, 2000);
+  });
+}
+</script>
 <script>
 window.addEventListener('load', function() {
   setTimeout(async function() {
