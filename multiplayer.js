@@ -871,3 +871,266 @@ if (document.readyState === 'loading') {
 window.AJ_SERVER = MP;
 window.FriendsUI = { render: () => UI.renderFriends() };
 window.LobbyUI = { render: () => UI.renderLobby() };
+
+// ================================================================
+//  BR SYNC — синхронизация позиций в реальном времени
+// ================================================================
+const BRSync = {
+  active: false,
+  roomId: null,
+  remotes: {},   // playerId -> {x,y,hp,maxHp,alive,charIcon,nick,team,emojiId}
+  syncInterval: null,
+  fighterId: 100, // id для удалённых fighters
+
+  start(msg) {
+    this.active = true;
+    this.roomId = msg.roomId;
+    this.remotes = {};
+
+    // Инициализируем удалённых игроков
+    (msg.players || []).forEach(p => {
+      if (p.id !== MP.playerId) {
+        this.remotes[p.id] = {
+          id: p.id, nick: p.nickname, team: p.team,
+          charIcon: p.charIcon || '🍎',
+          x: 800, y: 600, hp: 1000, maxHp: 1000,
+          alive: true, emojiId: null,
+          fid: this.fighterId++
+        };
+      }
+    });
+
+    // Отправляем свою позицию 20 раз в секунду
+    this.syncInterval = setInterval(() => this.sendPos(), 50);
+
+    // Ждём запуска brGame и добавляем игроков
+    this.waitAndInject();
+  },
+
+  stop() {
+    this.active = false;
+    clearInterval(this.syncInterval);
+    this.remotes = {};
+  },
+
+  sendPos() {
+    if (!this.active || !window.brGame) return;
+    const p = window.brGame.fighters && window.brGame.fighters[0];
+    if (!p) return;
+    MP.send({
+      type: 'BR_POS',
+      x: Math.round(p.x), y: Math.round(p.y),
+      hp: p.hp, maxHp: p.maxHp, alive: p.alive,
+      charIcon: p.charIcon,
+      emojiId: p.emojiId || null
+    });
+  },
+
+  onPos(pid, data) {
+    if (!this.remotes[pid]) return;
+    const r = this.remotes[pid];
+    r.x = data.x; r.y = data.y;
+    r.hp = data.hp; r.maxHp = data.maxHp;
+    r.alive = data.alive;
+    r.emojiId = data.emojiId;
+
+    // Обновляем fighter если уже инжектирован
+    if (window.brGame && window.brGame.fighters) {
+      const f = window.brGame.fighters.find(x => x.remoteId === pid);
+      if (f) {
+        // Плавное движение
+        f.x += (r.x - f.x) * 0.4;
+        f.y += (r.y - f.y) * 0.4;
+        f.hp = r.hp; f.maxHp = r.maxHp; f.alive = r.alive;
+        f.emojiId = r.emojiId;
+      }
+    }
+  },
+
+  onDied(pid) {
+    if (this.remotes[pid]) this.remotes[pid].alive = false;
+    if (window.brGame && window.brGame.fighters) {
+      const f = window.brGame.fighters.find(x => x.remoteId === pid);
+      if (f) { f.alive = false; f.hp = 0; }
+    }
+  },
+
+  onShot(data) {
+    if (!window.brGame) return;
+    const now = performance.now();
+    // Найдём owner fighter
+    const ownerFighter = window.brGame.fighters.find(f => f.remoteId === data.ownerId);
+    if (!ownerFighter) return;
+
+    const atk = {
+      shape: data.shape || 'circle',
+      color: data.color || '#ff4444',
+      r: data.r || 9, w: data.w, h: data.h,
+      len: data.len, thick: data.thick,
+      spd: data.spd || 6,
+      dmgMin: data.dmgMin || 30,
+      dmgMax: data.dmgMax || 55,
+      emoji: data.emoji || '🍎'
+    };
+
+    if (atk.shape === 'burst' || atk.shape === 'shockwave') {
+      window.brGame.effects.push({
+        type: atk.shape, x: data.x, y: data.y,
+        color: atk.color, maxR: atk.r || 60,
+        r: 0, alpha: 0.8, owner: ownerFighter, atk,
+        born: now, life: 350
+      });
+    } else {
+      const cos = Math.cos(data.angle), sin = Math.sin(data.angle);
+      window.brGame.projectiles.push({
+        x: data.x, y: data.y, angle: data.angle,
+        vx: cos * atk.spd, vy: sin * atk.spd,
+        atk, owner: ownerFighter,
+        born: now, life: 1800, hit: new Set(),
+        isRemote: true
+      });
+    }
+  },
+
+  // Инжектируем удалённых игроков в fighters
+  waitAndInject() {
+    const check = () => {
+      if (!window.brGame || !window.brGame.fighters) {
+        setTimeout(check, 200);
+        return;
+      }
+      this.inject();
+    };
+    setTimeout(check, 500);
+  },
+
+  inject() {
+    if (!window.brGame) return;
+    Object.values(this.remotes).forEach(r => {
+      if (window.brGame.fighters.find(f => f.remoteId === r.id)) return;
+
+      const myTeam = MP.currentLobby ? null : null; // Определяется через msg.teams
+      const isAlly = false; // будет определено позже
+
+      window.brGame.fighters.push({
+        id: r.fid,
+        remoteId: r.id,
+        isPlayer: false,
+        isRemote: true,
+        nick: r.nick,
+        charIcon: r.charIcon,
+        char: { id: 1, name: r.nick, icon: r.charIcon },
+        charImgIdle: null, charImgWalk: null, charImgShoot: null,
+        spongeFacing: 1, spongeMoving: false, spongeShootTimer: 0,
+        atk: window.BR_ATTACKS ? (window.BR_ATTACKS[1]) : { shape:'circle', color:'#00ff41', r:9, spd:6, dmgMin:30, dmgMax:55, cd:700, emoji:'🍎' },
+        x: r.x, y: r.y, vx: 0, vy: 0,
+        hp: r.hp, maxHp: r.maxHp,
+        alive: true, place: null, trophyDelta: 0,
+        isTeamer: false, teamerTarget: null,
+        aggression: 0, dodgeChance: 0, critChance: 0.1,
+        lastAtk: 0, stunUntil: 0, radius: 20,
+        dmgMultiplier: 1, powerCubes: 0,
+        inBush: false, bushTimer: 0,
+        emojiId: null, emojiTimer: 0,
+        targetId: -1, aiTimer: 0,
+        wanderAngle: 0,
+        noAI: true,  // отключаем AI для этого fighter
+        isRealPlayer: true  // пометка что это реальный игрок
+      });
+
+      console.log('[BRSync] Добавлен игрок:', r.nick);
+    });
+
+    // Патчим AI чтобы не трогал удалённых игроков
+    this.patchAI();
+  },
+
+  patchAI() {
+    // Перехватываем applyBRDamage чтобы не применять урон к удалённым (урон считает сервер)
+    const orig = window.applyBRDamage;
+    if (orig && !orig._patched) {
+      window.applyBRDamage = function(attacker, target, damage) {
+        // Если атакуем удалённого игрока — отправляем хит на сервер
+        if (target && target.remoteId) {
+          MP.send({ type: 'BR_HIT', targetId: target.remoteId, damage: Math.round(damage) });
+          return; // сервер сам применит урон
+        }
+        // Если нас атакует удалённый — игнорируем (урон уже пришёл с сервера)
+        if (attacker && attacker.isRemote) return;
+        orig(attacker, target, damage);
+      };
+      window.applyBRDamage._patched = true;
+    }
+
+    // Перехватываем spawnProjectile чтобы отправлять выстрелы
+    const origSpawn = window.spawnProjectile;
+    if (origSpawn && !origSpawn._patched) {
+      window.spawnProjectile = function(owner, angle, atk) {
+        origSpawn(owner, angle, atk);
+        if (owner && owner.isPlayer && BRSync.active) {
+          MP.send({
+            type: 'BR_SHOT',
+            x: Math.round(owner.x), y: Math.round(owner.y),
+            angle: angle,
+            shape: atk.shape, color: atk.color,
+            r: atk.r, w: atk.w, h: atk.h,
+            len: atk.len, thick: atk.thick, spd: atk.spd,
+            dmgMin: atk.dmgMin, dmgMax: atk.dmgMax, emoji: atk.emoji
+          });
+        }
+      };
+      window.spawnProjectile._patched = true;
+    }
+
+    // Отключаем AI для удалённых fighters
+    const fighters = window.brGame.fighters;
+    const origLoop = window.brGameLoop;
+    if (origLoop && !origLoop._patched && fighters) {
+      // Помечаем что fighters с noAI не обрабатываются AI
+      // Это делается через флаг noAI который проверяется в AI коде
+      // Но поскольку AI код уже написан — просто обнуляем targetId у удалённых
+      setInterval(() => {
+        if (!window.brGame) return;
+        window.brGame.fighters.forEach(f => {
+          if (f.noAI) {
+            f.aiTimer = 9999; // предотвращаем AI тики
+            f.targetId = -1;
+          }
+        });
+      }, 100);
+    }
+  }
+};
+
+// Добавляем обработку BR сообщений в MP
+const _origHandle2 = MP._handle.bind(MP);
+MP._handle = function(msg) {
+  switch (msg.type) {
+    case 'BR_POS':
+      if (msg.playerId) BRSync.onPos(msg.playerId, msg);
+      break;
+    case 'BR_SHOT':
+      if (msg.playerId !== MP.playerId) BRSync.onShot(msg);
+      break;
+    case 'BR_PLAYER_DIED':
+      BRSync.onDied(msg.playerId);
+      _notify('💀 ' + msg.nick, 'выбыл', 'trophies');
+      break;
+    case 'BR_DAMAGE':
+      // Нас ударил удалённый игрок
+      if (window.brGame && window.brGame.fighters) {
+        const me = window.brGame.fighters[0];
+        if (me && me.alive) {
+          me.hp = Math.max(0, msg.newHp);
+          if (me.hp <= 0) me.alive = false;
+        }
+      }
+      break;
+    case 'MM_LAUNCH':
+      BRSync.start(msg);
+      MM.onLaunch(msg);
+      break;
+    default:
+      _origHandle2(msg);
+  }
+};
