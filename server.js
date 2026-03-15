@@ -66,6 +66,7 @@ async function getPlayerByToken(token) {
 const conns = new Map();      // playerId -> ws
 const wsMap = new Map();      // ws -> playerId
 const playerLobby = new Map(); // playerId -> lobbyId
+const brRooms = new Map();    // playerId -> Set of playerIds in same match
 
 // ============================================================
 //  MATCHMAKING QUEUE
@@ -142,6 +143,10 @@ function mmLaunch() {
     team: teams[p.id],
     charIcon: p.charIcon
   }));
+
+  // Создаём комнату для синхронизации BR
+  const roomSet = new Set(q.players.map(p => p.id));
+  q.players.forEach(p => { brRooms.set(p.id, roomSet); });
 
   q.players.forEach(p => {
     const ws = conns.get(p.id);
@@ -370,7 +375,8 @@ wss.on('connection', ws => {
 
       case 'LOBBY_INVITE': {
         if (!player) return;
-        const lobbyId = playerLobby.get(playerId);
+        brRooms.delete(playerId);
+    const lobbyId = playerLobby.get(playerId);
         if (!lobbyId) return send(ws, { type: 'ERROR', text: 'Сначала создай лобби' });
         const lobby = await rGet('lobby:' + lobbyId);
         if (!lobby) return send(ws, { type: 'ERROR', text: 'Лобби не найдено' });
@@ -406,7 +412,8 @@ wss.on('connection', ws => {
 
       case 'LOBBY_LEAVE': {
         if (!player) return;
-        const lobbyId = playerLobby.get(playerId);
+        brRooms.delete(playerId);
+    const lobbyId = playerLobby.get(playerId);
         if (!lobbyId) return;
         const lobby = await rGet('lobby:' + lobbyId);
         playerLobby.delete(playerId);
@@ -423,7 +430,8 @@ wss.on('connection', ws => {
       }
 
       case 'LOBBY_GET': {
-        const lobbyId = playerLobby.get(playerId);
+        brRooms.delete(playerId);
+    const lobbyId = playerLobby.get(playerId);
         if (lobbyId) {
           const lobby = await rGet('lobby:' + lobbyId);
           send(ws, { type: 'LOBBY_DATA', lobby: lobby ? await buildLobby(lobby) : null });
@@ -435,7 +443,8 @@ wss.on('connection', ws => {
 
       case 'LOBBY_START_KB': {
         if (!player) return;
-        const lobbyId = playerLobby.get(playerId);
+        brRooms.delete(playerId);
+    const lobbyId = playerLobby.get(playerId);
         if (!lobbyId) return send(ws, { type: 'ERROR', text: 'Нет лобби' });
         const lobby = await rGet('lobby:' + lobbyId);
         if (!lobby) return send(ws, { type: 'ERROR', text: 'Лобби не найдено' });
@@ -458,7 +467,8 @@ wss.on('connection', ws => {
 
       case 'LOBBY_CHAT': {
         if (!player) return;
-        const lobbyId = playerLobby.get(playerId);
+        brRooms.delete(playerId);
+    const lobbyId = playerLobby.get(playerId);
         if (!lobbyId) return;
         const lobby = await rGet('lobby:' + lobbyId);
         if (!lobby) return;
@@ -541,13 +551,47 @@ wss.on('connection', ws => {
         break;
       }
 
+      // ---- BR SYNC ----
+      case 'BR_POS': {
+        // Рассылаем позицию всем в той же очереди/комнате
+        if (!player) break;
+        const room = brRooms.get(playerId);
+        if (!room) break;
+        room.forEach(pid => {
+          if (pid === playerId) return;
+          const tw = conns.get(pid);
+          if (tw) send(tw, { type: 'BR_POS', playerId, x: msg.x, y: msg.y, hp: msg.hp, maxHp: msg.maxHp, alive: msg.alive, charIcon: msg.charIcon, emojiId: msg.emojiId });
+        });
+        break;
+      }
+
+      case 'BR_SHOT': {
+        if (!player) break;
+        const room = brRooms.get(playerId);
+        if (!room) break;
+        room.forEach(pid => {
+          if (pid === playerId) return;
+          const tw = conns.get(pid);
+          if (tw) send(tw, { type: 'BR_SHOT', playerId, ...msg });
+        });
+        break;
+      }
+
+      case 'BR_HIT': {
+        if (!player) break;
+        const tw = conns.get(msg.targetId);
+        if (tw) send(tw, { type: 'BR_DAMAGE', fromId: playerId, fromNick: player.nickname, damage: msg.damage, newHp: Math.max(0, (msg.currentHp || 1000) - msg.damage) });
+        break;
+      }
+
       case 'KB_RESULT': {
         if (!player) return;
         player.stats = player.stats || { wins: 0, games: 0 };
         player.stats.games++;
         if (msg.won) player.stats.wins++;
         await savePlayer(player);
-        const lobbyId = playerLobby.get(playerId);
+        brRooms.delete(playerId);
+    const lobbyId = playerLobby.get(playerId);
         if (lobbyId) {
           const lobby = await rGet('lobby:' + lobbyId);
           if (lobby) { lobby.status = 'waiting'; await rSet('lobby:' + lobbyId, lobby); broadcast(lobby.players, { type: 'LOBBY_UPDATED', lobby: await buildLobby(lobby) }); }
@@ -572,6 +616,7 @@ wss.on('connection', ws => {
       }
     }
 
+    brRooms.delete(playerId);
     const lobbyId = playerLobby.get(playerId);
     if (lobbyId) {
       const lobby = await rGet('lobby:' + lobbyId);
