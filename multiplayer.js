@@ -613,58 +613,68 @@ function injectFriendsSection() {
 //  INIT — запускается после загрузки игры
 // ================================================================
 async function initMultiplayer() {
-  // Восстановить сессию если был игрок
-  const savedId   = localStorage.getItem('aj_player_id');
+  const savedId    = localStorage.getItem('aj_player_id');
   const savedToken = localStorage.getItem('aj_device_token');
-
-  if (savedId && savedToken && window.gameData?.playerNickname) {
-    try {
-      await AJ_SERVER.auth(window.gameData.playerNickname || 'Игрок');
-      AJ_SERVER.connect();
-    } catch(e) {
-      console.warn('Мультиплеер: не удалось подключиться к серверу', e);
-    }
-  }
 
   injectFriendsSection();
 
-  // Хук: когда игрок вводит никнейм — регистрируем на сервере
-  const origNickConfirm = document.getElementById('nickname-confirm-btn');
-  if (origNickConfirm) {
-    origNickConfirm.addEventListener('click', async () => {
-      setTimeout(async () => {
-        const nick = window.gameData?.playerNickname;
-        if (nick && !AJ_SERVER.playerId) {
-          try {
-            await AJ_SERVER.auth(nick);
-            AJ_SERVER.connect();
-            // Показываем ID игроку
-            setTimeout(() => {
-              showNotification('🆔 Ваш ID', `${AJ_SERVER.playerId} (нажмите для копирования)`, 'unlock');
-            }, 500);
-          } catch(e) {}
-        }
-      }, 800);
-    }, { once: true });
+  // Если уже есть сохранённый аккаунт — подключаемся сразу
+  if (savedId && savedToken) {
+    try {
+      // Берём никнейм из gameData если есть, иначе из localStorage
+      const nick = window.gameData?.playerNickname
+                || localStorage.getItem('aj_nickname')
+                || 'Игрок';
+      await AJ_SERVER.auth(nick);
+      AJ_SERVER.connect();
+    } catch(e) {
+      console.warn('Мультиплеер: ошибка подключения', e);
+    }
   }
 
-  // Показать ID в инфо-баре если уже есть
-  if (savedId) {
-    setTimeout(() => {
-      const infoBar = document.querySelector('.player-info-bar');
-      if (infoBar) {
-        const idBadge = document.createElement('span');
-        idBadge.style.cssText = 'font-size:10px;color:#44bb44;cursor:pointer;border:1px solid rgba(0,255,65,0.3);border-radius:4px;padding:1px 5px;';
-        idBadge.title = 'Нажмите для копирования ID';
-        idBadge.textContent = savedId;
-        idBadge.onclick = () => {
-          navigator.clipboard.writeText(savedId);
-          showNotification('📋 Скопировано!', savedId, 'unlock');
-        };
-        infoBar.appendChild(idBadge);
-      }
-    }, 1000);
+  // Хук на кнопку подтверждения никнейма
+  function hookNickBtn() {
+    const btn = document.getElementById('nickname-confirm-btn');
+    if (!btn) { setTimeout(hookNickBtn, 500); return; }
+    btn.addEventListener('click', async () => {
+      setTimeout(async () => {
+        const nick = window.gameData?.playerNickname
+                  || document.getElementById('nickname-input')?.value?.trim();
+        if (nick && !AJ_SERVER.playerId) {
+          try {
+            localStorage.setItem('aj_nickname', nick);
+            await AJ_SERVER.auth(nick);
+            AJ_SERVER.connect();
+            setTimeout(() => {
+              showNotification('🆔 Ваш ID', `${AJ_SERVER.playerId}`, 'unlock');
+              FriendsUI.render();
+            }, 1000);
+          } catch(e) { console.warn('auth error', e); }
+        }
+      }, 1000);
+    });
   }
+  hookNickBtn();
+
+  // Показать ID в инфо-баре
+  function showIdInBar() {
+    const id = AJ_SERVER.playerId || savedId;
+    if (!id) { setTimeout(showIdInBar, 2000); return; }
+    const infoBar = document.querySelector('.player-info-bar');
+    if (!infoBar) { setTimeout(showIdInBar, 1000); return; }
+    if (document.getElementById('aj-id-badge')) return;
+    const idBadge = document.createElement('span');
+    idBadge.id = 'aj-id-badge';
+    idBadge.style.cssText = 'font-size:10px;color:#44bb44;cursor:pointer;border:1px solid rgba(0,255,65,0.3);border-radius:4px;padding:1px 6px;margin-left:4px;';
+    idBadge.title = 'Нажмите для копирования';
+    idBadge.textContent = id;
+    idBadge.onclick = () => {
+      navigator.clipboard.writeText(id).catch(()=>{});
+      showNotification('📋 ID скопирован!', id, 'unlock');
+    };
+    infoBar.appendChild(idBadge);
+  }
+  setTimeout(showIdInBar, 2000);
 }
 
 // Запуск
