@@ -12434,5 +12434,29 @@
     </div>
 
 <script src="/multiplayer.js"></script>
+<script>
+window.addEventListener('load', function() {
+  setTimeout(async function() {
+    try {
+      const nick = (window.gameData && window.gameData.playerNickname)
+                || localStorage.getItem('aj_nickname')
+                || localStorage.getItem('appleRebirthGame') && JSON.parse(localStorage.getItem('appleRebirthGame')).playerNickname
+                || 'Игрок';
+      if (!AJ_SERVER.playerId) {
+        await AJ_SERVER.auth(nick);
+        AJ_SERVER.connect();
+        localStorage.setItem('aj_nickname', nick);
+        setTimeout(function() {
+          if (typeof showNotification === 'function') {
+            showNotification('🆔 Ваш ID', AJ_SERVER.playerId, 'unlock');
+          }
+          if (typeof FriendsUI !== 'undefined') FriendsUI.render();
+          if (typeof LobbyUI !== 'undefined') LobbyUI.render();
+        }, 1000);
+      }
+    } catch(e) { console.warn('Multiplayer init error:', e); }
+  }, 2000);
+});
+</script>
 </body>
 </html>
