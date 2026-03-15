@@ -79,6 +79,71 @@ async function getPlayerByToken(token) {
 const connections = new Map();
 const wsToPlayer  = new Map();
 const gameRooms   = new Map();
+
+// ============================================================
+//  MATCHMAKING QUEUE
+// ============================================================
+let matchQueue = []; // [{playerId, joinedAt, charIcon, nick}]
+const MATCH_SIZE = 10;       // макс игроков в матче
+const MATCH_WAIT = 10000;    // 10 секунд ждём
+let matchTimer = null;
+
+function startMatchTimer() {
+  if (matchTimer) return;
+  matchTimer = setTimeout(() => {
+    launchMatch();
+  }, MATCH_WAIT);
+}
+
+function launchMatch() {
+  clearTimeout(matchTimer);
+  matchTimer = null;
+  if (matchQueue.length < 1) return;
+
+  const players = matchQueue.splice(0, MATCH_SIZE);
+  const roomId = 'MATCH-' + Date.now();
+
+  // Назначить команды
+  const teams = {};
+  players.forEach((p, i) => { teams[p.playerId] = i % 2 === 0 ? 'A' : 'B'; });
+
+  const playersInfo = players.map(p => ({
+    id: p.playerId,
+    nickname: p.nick || '???',
+    team: teams[p.playerId],
+    charIcon: p.charIcon || '🍎'
+  }));
+
+  // Создать игровую комнату
+  const room = new GameRoom(roomId, playersInfo);
+  gameRooms.set(roomId, room);
+
+  // Сохранить лобби маппинг
+  players.forEach(p => playerLobbies.set(p.playerId, roomId));
+
+  // Запустить у всех
+  const pids = players.map(p => p.playerId);
+  broadcast(pids, {
+    type: 'LOBBY_KB_START',
+    lobbyId: roomId,
+    roomId,
+    teams,
+    players: playersInfo,
+    isMatchmaking: true
+  });
+
+  console.log('[Matchmaking] Запущен матч:', roomId, 'игроков:', players.length);
+
+  // Если остались в очереди — запустить новый таймер
+  if (matchQueue.length > 0) startMatchTimer();
+}
+
+function broadcastQueueUpdate() {
+  matchQueue.forEach(p => {
+    const ws = connections.get(p.playerId);
+    if (ws) send(ws, { type: 'QUEUE_UPDATE', count: matchQueue.length, max: MATCH_SIZE });
+  });
+}
 const playerLobbies = new Map(); // playerId -> lobbyId (in-memory)
 
 // ============================================================
@@ -180,6 +245,121 @@ function findRoomByPlayer(pid) {
   }
   return null;
 }
+// ============================================================
+//  MATCHMAKING
+// ============================================================
+let currentQueue = null; // { id, players:[{id,nick,charIcon}], timer, startTime }
+
+function startMatchmaking(playerId, nick, charIcon) {
+  // Уже в очереди?
+  if (currentQueue && currentQueue.players.find(p => p.id === playerId)) return;
+
+  // Создать новую очередь если нет
+  if (!currentQueue) {
+    currentQueue = {
+      id: uuidv4().slice(0,8).toUpperCase(),
+      players: [],
+      startTime: Date.now(),
+      timeLimit: 10000 // 10 секунд
+    };
+    console.log('[MM] Новая очередь:', currentQueue.id);
+  }
+
+  // Добавить игрока
+  currentQueue.players.push({ id: playerId, nick, charIcon: charIcon||'🍎' });
+  console.log('[MM] Игрок добавлен:', nick, '| В очереди:', currentQueue.players.length);
+
+  // Оповестить всех в очереди
+  broadcastQueue();
+
+  // Запустить таймер если ещё не запущен
+  if (!currentQueue.timer) {
+    currentQueue.timer = setInterval(() => tickMatchmaking(), 1000);
+  }
+
+  // Если 10 игроков — запустить сразу
+  if (currentQueue.players.length >= 10) {
+    launchMatch();
+  }
+}
+
+function leaveMatchmaking(playerId) {
+  if (!currentQueue) return;
+  currentQueue.players = currentQueue.players.filter(p => p.id !== playerId);
+  if (currentQueue.players.length === 0) {
+    clearInterval(currentQueue.timer);
+    currentQueue = null;
+    return;
+  }
+  broadcastQueue();
+}
+
+function broadcastQueue() {
+  if (!currentQueue) return;
+  const elapsed = Date.now() - currentQueue.startTime;
+  const timeLeft = Math.max(0, Math.ceil((currentQueue.timeLimit - elapsed) / 1000));
+  currentQueue.players.forEach(p => {
+    const ws = connections.get(p.id);
+    if (ws) send(ws, {
+      type: 'QUEUE_UPDATE',
+      count: currentQueue.players.length,
+      max: 10,
+      found: currentQueue.players.length,
+      total: 10,
+      timeLeft,
+      players: currentQueue.players.map(x => ({ nick: x.nick, charIcon: x.charIcon }))
+    });
+  });
+}
+
+function tickMatchmaking() {
+  if (!currentQueue) return;
+  const elapsed = Date.now() - currentQueue.startTime;
+  const timeLeft = Math.max(0, Math.ceil((currentQueue.timeLimit - elapsed) / 1000));
+  broadcastQueue();
+  if (elapsed >= currentQueue.timeLimit) {
+    launchMatch();
+  }
+}
+
+function launchMatch() {
+  if (!currentQueue || currentQueue.players.length === 0) return;
+  clearInterval(currentQueue.timer);
+  const queue = currentQueue;
+  currentQueue = null;
+
+  console.log('[MM] Запуск матча! Игроков:', queue.players.length);
+
+  // Назначить команды
+  const teams = {};
+  queue.players.forEach((p, i) => { teams[p.id] = i % 2 === 0 ? 'A' : 'B'; });
+
+  // Создать игровую комнату
+  const playersInfo = queue.players.map(p => ({
+    id: p.id,
+    nickname: p.nick,
+    team: teams[p.id],
+    charIcon: p.charIcon
+  }));
+  const room = new GameRoom(queue.id, playersInfo);
+  gameRooms.set(queue.id, room);
+
+  // Запустить у всех
+  queue.players.forEach(p => {
+    const ws = connections.get(p.id);
+    if (ws) send(ws, {
+      type: 'LOBBY_KB_START',
+      isMatchmaking: true,
+      lobbyId: queue.id,
+      roomId: queue.id,
+      teams,
+      players: playersInfo,
+      myTeam: teams[p.id],
+      realPlayers: queue.players.length
+    });
+  });
+}
+
 
 // ============================================================
 //  REST API
@@ -441,6 +621,40 @@ wss.on('connection', (ws) => {
         break;
       }
 
+      // ============================================================
+      //  MATCHMAKING
+      // ============================================================
+      case 'QUEUE_JOIN': {
+        if (!player) return;
+        // Убрать из очереди если уже есть
+        matchQueue = matchQueue.filter(p => p.playerId !== playerId);
+        // Добавить в очередь
+        matchQueue.push({
+          playerId,
+          nick: player.nickname || '???',
+          charIcon: msg.charIcon || '🍎',
+          joinedAt: Date.now()
+        });
+        console.log('[Queue] Игрок добавлен:', player.nickname, 'В очереди:', matchQueue.length);
+        send(ws, { type: 'QUEUE_JOINED', count: matchQueue.length, max: MATCH_SIZE });
+        broadcastQueueUpdate();
+        // Если набралось MATCH_SIZE — запустить сразу
+        if (matchQueue.length >= MATCH_SIZE) {
+          launchMatch();
+        } else {
+          startMatchTimer();
+        }
+        break;
+      }
+
+      case 'QUEUE_LEAVE': {
+        matchQueue = matchQueue.filter(p => p.playerId !== playerId);
+        send(ws, { type: 'QUEUE_LEFT' });
+        broadcastQueueUpdate();
+        if (matchQueue.length === 0) { clearTimeout(matchTimer); matchTimer = null; }
+        break;
+      }
+
       case 'LOBBY_START_KB': {
         if (!player) return;
         const lobbyId=playerLobbies.get(playerId);
@@ -461,6 +675,20 @@ wss.on('connection', (ws) => {
         const room = new GameRoom(lobby.id, playersInfo);
         gameRooms.set(lobby.id, room);
         broadcast(lobby.players,{type:'LOBBY_KB_START',lobbyId:lobby.id,roomId:lobby.id,teams,players:playersInfo});
+        break;
+      }
+
+      case 'MM_JOIN':
+      case 'QUEUE_JOIN': {
+        if (!player) return send(ws, {type:'ERROR', text:'Сначала войди в игру'});
+        startMatchmaking(playerId, player.nickname||'???', msg.charIcon||'🍎');
+        break;
+      }
+
+      case 'MM_LEAVE':
+      case 'QUEUE_LEAVE': {
+        leaveMatchmaking(playerId);
+        send(ws, {type:'MM_LEFT'});
         break;
       }
 
@@ -587,6 +815,9 @@ wss.on('connection', (ws) => {
     wsToPlayer.delete(ws);
     const player=await getPlayer(playerId);
     if(player) for(const fid of (player.friends||[])){ const fw=connections.get(fid); if(fw) send(fw,{type:'FRIEND_OFFLINE',friendId:playerId}); }
+    // Remove from matchmaking queue
+    matchQueue = matchQueue.filter(p => p.playerId !== playerId);
+    broadcastQueueUpdate();
     const lobbyId=playerLobbies.get(playerId);
     if(lobbyId){
       const lobby=await getLobby(lobbyId);
@@ -597,6 +828,7 @@ wss.on('connection', (ws) => {
         else { if(lobby.host===playerId) lobby.host=lobby.players[0]; await saveLobby(lobby); broadcast(lobby.players,{type:'LOBBY_UPDATED',lobby:await buildLobbyData(lobby)}); }
       }
     }
+    leaveMatchmaking(playerId);
     const room=findRoomByPlayer(playerId);
     if(room){ const state=room.states[playerId]; if(state){ state.alive=false; room.broadcastAll({type:'REMOTE_PLAYER_DIED',playerId,nick:player?.nickname,killerNick:'disconnect'}); } }
   });
