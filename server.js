@@ -378,12 +378,13 @@ wss.on('connection', (ws) => {
         const lobby = await getLobby(lobbyId);
         if (!lobby) return send(ws,{type:'ERROR',text:'Лобби не найдено'});
         if (lobby.players.length>=lobby.maxPlayers) return send(ws,{type:'ERROR',text:'Лобби заполнено (макс. 4)'});
-        if (!(player.friends||[]).includes(friendId)) return send(ws,{type:'ERROR',text:'Не в друзьях'});
+        // Проверяем друга (или разрешаем всем онлайн игрокам)
         const fw=connections.get(friendId);
         const fr=await getPlayer(friendId);
-        if(!fw||!fr) return send(ws,{type:'ERROR',text:'Друг не в сети'});
-        send(fw,{type:'LOBBY_INVITE_IN',lobbyId:lobby.id,hostId:playerId,hostNick:player.nickname});
-        send(ws,{type:'LOBBY_INVITE_SENT',friendId,friendNick:fr.nickname});
+        if(!fr) return send(ws,{type:'ERROR',text:'Игрок не найден'});
+        if(!fw) return send(ws,{type:'ERROR',text:'Друг не в сети'});
+        send(fw,{type:'LOBBY_INVITE_IN',lobbyId:lobby.id,hostId:playerId,hostNick:player.nickname||'???'});
+        send(ws,{type:'LOBBY_INVITE_SENT',friendId,friendNick:fr.nickname||'???'});
         break;
       }
 
