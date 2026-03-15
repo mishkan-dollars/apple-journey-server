@@ -7106,6 +7106,49 @@
             if (!nameEl || !titleEl) return;
             const name = gameData.username || '???';
             nameEl.textContent = name;
+            // MULTIPLAYER: подключаемся как только появился ник
+            if (gameData.username && gameData.username.length >= 2) {
+                setTimeout(async function() {
+                    try {
+                        if (typeof AJ_SERVER !== 'undefined' && !AJ_SERVER.playerId) {
+                            const result = await AJ_SERVER.auth(gameData.username);
+                            localStorage.setItem('aj_nickname', gameData.username);
+                            AJ_SERVER.connect();
+                            setTimeout(function() {
+                                // Показать ID
+                                const bar = document.getElementById('player-info-bar');
+                                if (bar && !document.getElementById('aj-id-badge')) {
+                                    const b = document.createElement('span');
+                                    b.id = 'aj-id-badge';
+                                    b.style.cssText = 'font-size:11px;color:#44bb44;cursor:pointer;border:1px solid rgba(0,255,65,0.4);border-radius:4px;padding:2px 8px;margin-left:8px;white-space:nowrap;';
+                                    b.textContent = AJ_SERVER.playerId;
+                                    b.onclick = function() {
+                                        navigator.clipboard.writeText(AJ_SERVER.playerId).catch(function(){});
+                                        showNotification('ID скопирован!', AJ_SERVER.playerId, 'unlock');
+                                    };
+                                    bar.appendChild(b);
+                                }
+                                if (typeof FriendsUI !== 'undefined') FriendsUI.render();
+                                if (typeof LobbyUI !== 'undefined') LobbyUI.render();
+                            }, 1000);
+                        } else if (typeof AJ_SERVER !== 'undefined' && AJ_SERVER.playerId) {
+                            // Уже авторизован — просто обновить бейдж
+                            const bar = document.getElementById('player-info-bar');
+                            if (bar && !document.getElementById('aj-id-badge')) {
+                                const b = document.createElement('span');
+                                b.id = 'aj-id-badge';
+                                b.style.cssText = 'font-size:11px;color:#44bb44;cursor:pointer;border:1px solid rgba(0,255,65,0.4);border-radius:4px;padding:2px 8px;margin-left:8px;white-space:nowrap;';
+                                b.textContent = AJ_SERVER.playerId;
+                                b.onclick = function() {
+                                    navigator.clipboard.writeText(AJ_SERVER.playerId).catch(function(){});
+                                    showNotification('ID скопирован!', AJ_SERVER.playerId, 'unlock');
+                                };
+                                bar.appendChild(b);
+                            }
+                        }
+                    } catch(e) { console.warn('MP auth error:', e); }
+                }, 300);
+            }
             if (gameData.equippedTitle) {
                 const charId = gameData.equippedTitle;
                 const titleData = CHARACTER_TITLES[charId];
