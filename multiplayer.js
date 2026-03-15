@@ -743,21 +743,44 @@ const LobbyUI = {
 
   startKB(msg) {
     const myTeam = msg.teams[AJ_SERVER.playerId];
-    const others = msg.players.filter(p => p.id !== AJ_SERVER.playerId);
-    if (typeof showNotification === 'function')
-      showNotification(`⚔️ КБ! Команда ${myTeam}`, `Против: ${others.map(p=>p.nickname).join(', ')||'боты'}`, 'unlock');
     window._kbLobbyMatch = msg;
-    if (typeof showSection === 'function') showSection('battle-royale');
-    setTimeout(() => {
-      const banner = document.createElement('div');
-      banner.style.cssText = `position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,0.95);border:3px solid ${myTeam==='A'?'#00ff41':'#ff4444'};border-radius:18px;padding:24px 36px;z-index:99999;text-align:center;font-family:'Share Tech Mono',monospace;`;
-      banner.innerHTML = `
-        <div style="font-size:28px;color:${myTeam==='A'?'var(--matrix-green)':'#ff4444'};letter-spacing:4px;margin-bottom:8px;">КОМАНДА ${myTeam}</div>
-        <div style="font-size:13px;color:#888;">Союзники: ${msg.players.filter(p=>msg.teams[p.id]===myTeam&&p.id!==AJ_SERVER.playerId).map(p=>p.nickname).join(', ')||'только ты'}</div>
-        <div style="font-size:13px;color:#888;">Враги: ${msg.players.filter(p=>msg.teams[p.id]!==myTeam).map(p=>p.nickname).join(', ')||'боты'}</div>`;
-      document.body.appendChild(banner);
-      setTimeout(() => banner.remove(), 3000);
-    }, 300);
+
+    // Баннер с обратным отсчётом
+    const banner = document.createElement('div');
+    banner.id = 'kb-team-banner';
+    banner.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,0.97);border:3px solid ' + (myTeam==='A'?'#00ff41':'#ff4444') + ';border-radius:18px;padding:24px 36px;z-index:99999;text-align:center;font-family:Share Tech Mono,monospace;min-width:260px;';
+    const allies = msg.players.filter(p=>msg.teams[p.id]===myTeam&&p.id!==AJ_SERVER.playerId).map(p=>p.nickname).join(', ')||'только ты';
+    const enemies = msg.players.filter(p=>msg.teams[p.id]!==myTeam).map(p=>p.nickname).join(', ')||'боты';
+    banner.innerHTML = '<div style="font-size:13px;color:#888;margin-bottom:6px;">КБ ЗАПУСКАЕТСЯ</div>' +
+      '<div style="font-size:32px;color:' + (myTeam==='A'?'var(--matrix-green)':'#ff4444') + ';letter-spacing:4px;margin-bottom:10px;">КОМАНДА ' + myTeam + '</div>' +
+      '<div style="font-size:12px;color:#888;margin-bottom:4px;">Союзники: ' + allies + '</div>' +
+      '<div style="font-size:12px;color:#888;">Враги: ' + enemies + '</div>' +
+      '<div id="kb-countdown" style="font-size:48px;color:#FFD700;margin-top:14px;">3</div>';
+    document.body.appendChild(banner);
+
+    let count = 3;
+    const tick = setInterval(function() {
+      count--;
+      const el = document.getElementById('kb-countdown');
+      if (el) el.textContent = count > 0 ? count : '⚔️';
+      if (count <= 0) {
+        clearInterval(tick);
+        setTimeout(function() {
+          const b = document.getElementById('kb-team-banner');
+          if (b) b.remove();
+          if (typeof showSection === 'function') showSection('battle-royale');
+          function autoClick() {
+            const btn = document.getElementById('br-start-btn');
+            if (btn && btn.offsetParent !== null) {
+              btn.click();
+            } else {
+              setTimeout(autoClick, 300);
+            }
+          }
+          setTimeout(autoClick, 500);
+        }, 600);
+      }
+    }, 1000);
   }
 };
 
@@ -882,4 +905,336 @@ if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', () => setTimeout(initMultiplayer, 1500));
 } else {
   setTimeout(initMultiplayer, 1500);
+}
+
+// ================================================================
+//  BR MULTIPLAYER PATCH — реальный мультиплеер в КБ
+//  Подключается к игровому циклу и синхронизирует позиции
+// ================================================================
+const BRMultiplayer = {
+  active: false,
+  roomId: null,
+  myTeam: null,
+  remotePlayers: {}, // playerId -> state
+  remoteProjectiles: [], // снаряды от других игроков
+  syncInterval: null,
+  lastSent: 0,
+
+  // Запустить когда сервер дал сигнал старта КБ
+  init(msg) {
+    this.active = true;
+    this.roomId = msg.roomId || msg.lobbyId;
+    this.myTeam = msg.teams[AJ_SERVER.playerId];
+    this.remotePlayers = {};
+    this.remoteProjectiles = [];
+
+    // Инициализируем удалённых игроков
+    msg.players.forEach(p => {
+      if (p.id !== AJ_SERVER.playerId) {
+        this.remotePlayers[p.id] = {
+          id: p.id,
+          nick: p.nickname,
+          team: p.team,
+          charIcon: p.charIcon || '🍎',
+          x: 800, y: 600,
+          hp: 1000, maxHp: 1000,
+          alive: true,
+          superCharge: 0,
+          emojiId: null
+        };
+      }
+    });
+
+    // Отправляем состояние каждые 50мс
+    this.syncInterval = setInterval(() => this.sendState(), 50);
+
+    // Патчим игровой цикл
+    this.patchGameLoop();
+
+    console.log('[BRMulti] Инициализирован, комната:', this.roomId);
+  },
+
+  stop() {
+    this.active = false;
+    if (this.syncInterval) clearInterval(this.syncInterval);
+    this.syncInterval = null;
+    this.remotePlayers = {};
+    this.remoteProjectiles = [];
+  },
+
+  // Отправить свою позицию на сервер
+  sendState() {
+    if (!this.active || !window.brGame) return;
+    const player = window.brGame.fighters?.[0];
+    if (!player) return;
+    AJ_SERVER.send({
+      type: 'GAME_STATE',
+      x: Math.round(player.x),
+      y: Math.round(player.y),
+      hp: player.hp,
+      maxHp: player.maxHp,
+      alive: player.alive,
+      charIcon: player.charIcon,
+      superCharge: window.brGame.superCharge || 0,
+      emojiId: player.emojiId || null
+    });
+  },
+
+  // Когда стреляем — отправить снаряд на сервер
+  sendProjectile(owner, angle, atk) {
+    if (!this.active) return;
+    AJ_SERVER.send({
+      type: 'GAME_PROJECTILE',
+      proj: {
+        x: Math.round(owner.x),
+        y: Math.round(owner.y),
+        angle,
+        atkShape: atk.shape,
+        atkColor: atk.color,
+        atkR: atk.r,
+        atkW: atk.w,
+        atkH: atk.h,
+        atkLen: atk.len,
+        atkThick: atk.thick,
+        atkSpd: atk.spd,
+        dmgMin: atk.dmgMin,
+        dmgMax: atk.dmgMax,
+        atkEmoji: atk.emoji,
+        ownerId: AJ_SERVER.playerId
+      }
+    });
+  },
+
+  // Когда попадаем в удалённого игрока — отправить хит
+  sendHit(targetId, damage) {
+    if (!this.active) return;
+    AJ_SERVER.send({ type: 'GAME_HIT', targetId, damage });
+  },
+
+  // Обновить состояние удалённого игрока
+  onRoomState(msg) {
+    Object.entries(msg.states).forEach(([pid, state]) => {
+      if (pid === AJ_SERVER.playerId) return;
+      if (this.remotePlayers[pid]) {
+        Object.assign(this.remotePlayers[pid], state);
+      }
+    });
+  },
+
+  // Получить входящий снаряд от другого игрока
+  onRemoteProjectile(msg) {
+    const proj = msg.proj;
+    if (!proj || !window.brGame) return;
+    const now = performance.now();
+    // Конвертируем в формат локального снаряда
+    const localProj = {
+      x: proj.x, y: proj.y,
+      angle: proj.angle,
+      vx: proj.atkSpd ? Math.cos(proj.angle) * proj.atkSpd : 0,
+      vy: proj.atkSpd ? Math.sin(proj.angle) * proj.atkSpd : 0,
+      atk: {
+        shape: proj.atkShape || 'circle',
+        color: proj.atkColor || '#ff4444',
+        r: proj.atkR || 9,
+        w: proj.atkW, h: proj.atkH,
+        len: proj.atkLen, thick: proj.atkThick,
+        spd: proj.atkSpd || 6,
+        dmgMin: proj.dmgMin || 30,
+        dmgMax: proj.dmgMax || 55,
+        emoji: proj.atkEmoji || '🍎'
+      },
+      owner: { id: proj.ownerId, isPlayer: false, isTeamer: false, critChance: 0.1, dmgMultiplier: 1,
+               nick: proj.ownerNick || '???', isRemote: true },
+      born: now,
+      life: 2000,
+      hit: new Set(),
+      isRemote: true,
+      remoteOwnerId: proj.ownerId
+    };
+
+    if (window.brGame.projectiles) {
+      window.brGame.projectiles.push(localProj);
+    }
+  },
+
+  // Нас убили удалённым игроком
+  onRemoteKilled(msg) {
+    if (!window.brGame) return;
+    const player = window.brGame.fighters?.[0];
+    if (player && player.alive) {
+      player.hp = 0;
+      player.alive = false;
+      if (typeof showNotification === 'function')
+        showNotification('💀 ВЫ ПОГИБЛИ', `Убит: ${msg.byNick}`, 'trophies');
+    }
+  },
+
+  // Получили урон от удалённого игрока
+  onRemoteDamage(msg) {
+    if (!window.brGame) return;
+    const player = window.brGame.fighters?.[0];
+    if (player && player.alive) {
+      player.hp = Math.max(0, msg.newHp);
+      if (player.hp <= 0) player.alive = false;
+    }
+  },
+
+  // Патч игрового цикла — добавляем рендер удалённых игроков
+  patchGameLoop() {
+    // Ждём пока brGame инициализируется
+    const waitForGame = setInterval(() => {
+      if (!window.brGame || !window.brGame.ctx) return;
+      clearInterval(waitForGame);
+
+      // Патчим spawnProjectile чтобы отправлять снаряды на сервер
+      const origSpawn = window.spawnProjectile;
+      if (origSpawn) {
+        window.spawnProjectile = (owner, angle, atk) => {
+          origSpawn(owner, angle, atk);
+          // Если это игрок — отправляем на сервер
+          if (owner.isPlayer && BRMultiplayer.active) {
+            BRMultiplayer.sendProjectile(owner, angle, atk);
+          }
+        };
+      }
+
+      // Патчим applyBRDamage чтобы проверять удалённых игроков
+      const origDamage = window.applyBRDamage;
+      if (origDamage) {
+        window.applyBRDamage = (attacker, target, damage) => {
+          // Если цель — удалённый игрок
+          if (target.isRemote && target.id && BRMultiplayer.active) {
+            BRMultiplayer.sendHit(target.id, damage);
+            return;
+          }
+          origDamage(attacker, target, damage);
+        };
+      }
+
+      // Инжектируем удалённых игроков в fighters для рендера
+      this.injectRemoteFighters();
+
+      console.log('[BRMulti] Игровой цикл пропатчен');
+    }, 200);
+  },
+
+  // Добавляем удалённых игроков в массив fighters
+  injectRemoteFighters() {
+    const waitForFighters = setInterval(() => {
+      if (!window.brGame || !window.brGame.fighters) return;
+      clearInterval(waitForFighters);
+
+      Object.values(this.remotePlayers).forEach(rp => {
+        // Проверяем не добавлен ли уже
+        if (window.brGame.fighters.find(f => f.remoteId === rp.id)) return;
+
+        const remoteFighter = {
+          id: 100 + window.brGame.fighters.length,
+          remoteId: rp.id,
+          isPlayer: false,
+          isRemote: true,
+          nick: rp.nick,
+          charIcon: rp.charIcon || '🍎',
+          x: rp.x || 800, y: rp.y || 600,
+          hp: rp.hp || 1000, maxHp: rp.maxHp || 1000,
+          alive: true,
+          team: rp.team,
+          isFriend: true,
+          isTeamer: rp.team === this.myTeam, // союзники не атакуют друг друга
+          teamerTarget: null,
+          radius: 20,
+          atk: { shape:'circle', color:'#00ff41', r:9, spd:6, dmgMin:30, dmgMax:55, cd:700, emoji:'🍎' },
+          lastAtk: 0, stunUntil: 0,
+          aggression: 0.8, dodgeChance: 0.1, critChance: 0.15,
+          dmgMultiplier: 1, powerCubes: 0,
+          inBush: false, bushTimer: 0,
+          emojiId: null, emojiTimer: 0,
+          targetId: -1, aiTimer: 0,
+          wanderAngle: Math.random() * Math.PI * 2,
+          // Флаг что это управляется сервером а не ИИ
+          noAI: true,
+          remoteRef: rp
+        };
+
+        window.brGame.fighters.push(remoteFighter);
+        console.log('[BRMulti] Добавлен удалённый игрок:', rp.nick);
+      });
+
+      // Каждый кадр обновляем позиции удалённых fighters из remoteRef
+      this.startRemoteSync();
+    }, 300);
+  },
+
+  // Синхронизируем позиции удалённых fighters каждый кадр
+  startRemoteSync() {
+    const sync = () => {
+      if (!this.active) return;
+      if (window.brGame && window.brGame.fighters) {
+        window.brGame.fighters.forEach(f => {
+          if (!f.isRemote || !f.remoteRef) return;
+          const rp = f.remoteRef;
+          // Плавное движение к реальной позиции
+          f.x += (rp.x - f.x) * 0.3;
+          f.y += (rp.y - f.y) * 0.3;
+          f.hp = rp.hp;
+          f.maxHp = rp.maxHp;
+          f.alive = rp.alive;
+          f.emojiId = rp.emojiId;
+        });
+      }
+      requestAnimationFrame(sync);
+    };
+    requestAnimationFrame(sync);
+  }
+};
+
+// Обработка сообщений от сервера для BRMultiplayer
+const _origHandle = AJ_SERVER._handle.bind(AJ_SERVER);
+AJ_SERVER._handle = function(msg) {
+  switch(msg.type) {
+    case 'ROOM_STATE':
+      BRMultiplayer.onRoomState(msg);
+      break;
+    case 'REMOTE_PROJECTILE':
+      BRMultiplayer.onRemoteProjectile(msg);
+      break;
+    case 'REMOTE_KILLED':
+      BRMultiplayer.onRemoteKilled(msg);
+      break;
+    case 'REMOTE_DAMAGE':
+      BRMultiplayer.onRemoteDamage(msg);
+      break;
+    case 'REMOTE_PLAYER_DIED': {
+      if (window.brGame && window.brGame.fighters) {
+        const f = window.brGame.fighters.find(x => x.remoteId === msg.playerId);
+        if (f) { f.alive = false; f.hp = 0; }
+      }
+      if (typeof showNotification === 'function' && msg.playerId !== AJ_SERVER.playerId)
+        showNotification('💀 ' + msg.nick, `Убит: ${msg.killerNick||'???'}`, 'trophies');
+      break;
+    }
+    case 'LOBBY_KB_START':
+      // Инициализируем мультиплеер
+      BRMultiplayer.init(msg);
+      LobbyUI.startKB(msg);
+      break;
+    default:
+      _origHandle(msg);
+  }
+};
+
+// Остановить мультиплеер когда выходим из КБ
+const _origExitBR = window.exitBR;
+if (typeof window !== 'undefined') {
+  window.addEventListener('load', () => {
+    setTimeout(() => {
+      const origExit = window.exitBR;
+      if (origExit) {
+        window.exitBR = function() {
+          BRMultiplayer.stop();
+          origExit();
+        };
+      }
+    }, 2000);
+  });
 }
