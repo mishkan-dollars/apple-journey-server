@@ -227,11 +227,18 @@ app.get('/api/friends/:playerId', async (req, res) => {
   if (!p) return res.status(404).json({ error:'Не найден' });
   const friends = await Promise.all((p.friends||[]).map(async fid => {
     const f = await getPlayer(fid);
-    return f ? { id:f.id, nickname:f.nickname, online:getOnlineStatus(fid), stats:f.stats } : null;
+    if (!f) return null;
+    return {
+      id: f.id,
+      nickname: f.nickname || '???',
+      online: getOnlineStatus(fid),
+      stats: f.stats || {wins:0,games:0}
+    };
   }));
   const incoming = await Promise.all((p.friendRequests||[]).map(async fid => {
     const f = await getPlayer(fid);
-    return f ? { id:fid, nickname:f.nickname } : null;
+    if (!f) return null;
+    return { id:fid, nickname: f.nickname || '???' };
   }));
   res.json({ friends:friends.filter(Boolean), incoming:incoming.filter(Boolean) });
 });
@@ -326,9 +333,9 @@ wss.on('connection', (ws) => {
         if (!from.friends.includes(playerId)) from.friends.push(playerId);
         await savePlayer(player);
         await savePlayer(from);
-        send(ws,{type:'FRIEND_ADDED',friend:{id:fromId,nickname:from.nickname,online:getOnlineStatus(fromId)}});
+        send(ws,{type:'FRIEND_ADDED',friend:{id:fromId,nickname:from.nickname||'???',online:getOnlineStatus(fromId),stats:from.stats||{wins:0,games:0}}});
         const fw=connections.get(fromId);
-        if(fw) send(fw,{type:'FRIEND_ADDED',friend:{id:playerId,nickname:player.nickname,online:true}});
+        if(fw) send(fw,{type:'FRIEND_ADDED',friend:{id:playerId,nickname:player.nickname||'???',online:true,stats:player.stats||{wins:0,games:0}}});
         break;
       }
 
