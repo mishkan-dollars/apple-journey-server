@@ -790,27 +790,10 @@ function injectFriendsSection() {
   };
 }
 
-// ================================================================
-//  PATCH KБ BUTTON
-// ================================================================
+// КБ кнопка управляется через brStartMatchmaking в игре
 function patchKBButton() {
-  const btn = document.getElementById('br-start-btn');
-  if (!btn) { setTimeout(patchKBButton, 500); return; }
-
-  btn.textContent = '▶ НАЙТИ БОЙ';
-  btn.onclick = function() {
-    if (MP.playerId) {
-      MM.join();
-    } else {
-      // Нет подключения — обычный локальный запуск
-      if (typeof startBattleRoyale === 'function') {
-        const lobby = document.getElementById('br-lobby');
-        if (lobby) lobby.style.display = 'none';
-        startBattleRoyale();
-      }
-    }
-  };
-  console.log('[MP] КБ кнопка пропатчена');
+  // Кнопка уже настроена в index.html через onclick="brStartMatchmaking()"
+  // Просто убеждаемся что AJ_SERVER доступен глобально
 }
 
 // ================================================================
@@ -825,7 +808,6 @@ function _notify(title, desc, type) {
 // ================================================================
 async function initMP() {
   injectFriendsSection();
-  patchKBButton();
 
   // Показать ID в инфобаре
   function showIdBadge() {
@@ -1126,10 +1108,8 @@ MP._handle = function(msg) {
         }
       }
       break;
-    case 'MM_LAUNCH':
-      BRSync.start(msg);
-      MM.onLaunch(msg);
-      break;
+    // MM_LAUNCH handled by game's message handler (in index.html)
+    // BRSync is started from there
     default:
       _origHandle2(msg);
   }
