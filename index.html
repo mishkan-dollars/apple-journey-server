@@ -10060,7 +10060,7 @@
             const closeBrBtn = document.getElementById('close-br-btn');
             if (closeBrBtn) closeBrBtn.addEventListener('click', () => showSection('main'));
             const brStartBtn = document.getElementById('br-start-btn');
-            if (brStartBtn) brStartBtn.addEventListener('click', startBattleRoyale);
+            // BR start button handled by multiplayer.js (matchmaking)
             const brPlayAgainBtn = document.getElementById('br-play-again-btn');
             if (brPlayAgainBtn) brPlayAgainBtn.addEventListener('click', () => {
                 stopWinParticles();
@@ -12544,7 +12544,7 @@ function brStartMatchmaking() {
     }
   } catch(e) {}
 
-  AJ_SERVER.send({ type: 'QUEUE_JOIN', charIcon: charIcon });
+  AJ_SERVER.send({ type: 'MM_JOIN', charIcon: charIcon });
 
   _mmTimer = setInterval(function() {
     _mmSeconds--;
@@ -12558,7 +12558,7 @@ function brCancelMatchmaking() {
   _mmActive = false;
   clearInterval(_mmTimer);
   if (typeof AJ_SERVER !== 'undefined' && AJ_SERVER.playerId) {
-    AJ_SERVER.send({ type: 'QUEUE_LEAVE' });
+    AJ_SERVER.send({ type: 'MM_LEAVE' });
   }
   var btn = document.getElementById('br-start-btn');
   if (btn) btn.style.display = 'block';
@@ -12587,18 +12587,20 @@ if (typeof window !== 'undefined') {
 
       var origHandle = AJ_SERVER._handle.bind(AJ_SERVER);
       var patchedHandle = function(msg) {
-        if (msg.type === 'QUEUE_JOINED' || msg.type === 'QUEUE_UPDATE') {
+        if (msg.type === 'MM_UPDATE') {
           var countEl = document.getElementById('br-queue-count');
           var barEl = document.getElementById('br-queue-bar');
-          if (countEl) countEl.textContent = (msg.count || 1) + ' / ' + (msg.max || 10);
-          if (barEl) barEl.style.width = Math.min(100, ((msg.count || 1) / (msg.max || 10)) * 100) + '%';
+          if (countEl) countEl.textContent = (msg.found || 1) + ' / ' + (msg.total || 10);
+          if (barEl) barEl.style.width = Math.min(100, ((msg.found || 1) / (msg.total || 10)) * 100) + '%';
+          var timerEl2 = document.getElementById('br-queue-timer');
+          if (timerEl2) timerEl2.textContent = 'Запуск через: ' + (msg.timeLeft || 10) + ' сек';
           return;
         }
-        if (msg.type === 'QUEUE_LEFT') {
+        if (msg.type === 'MM_LEFT') {
           brCancelMatchmaking();
           return;
         }
-        if (msg.type === 'LOBBY_KB_START' && msg.isMatchmaking) {
+        if (msg.type === 'MM_LAUNCH') {
           // Матч найден! Запускаем
           _mmActive = false;
           clearInterval(_mmTimer);
@@ -12633,9 +12635,9 @@ if (typeof window !== 'undefined') {
                 // Запускаем КБ
                 var lobbyEl = document.getElementById('br-lobby');
                 if (lobbyEl) lobbyEl.style.display = 'none';
-                if (typeof initBattleRoyale === 'function') initBattleRoyale();
-                // Инициализируем мультиплеер
-                if (typeof BRMultiplayer !== 'undefined') BRMultiplayer.init(msg);
+                if (typeof startBattleRoyale === 'function') startBattleRoyale();
+                // Инициализируем BR синхронизацию
+                if (typeof BRSync !== 'undefined') BRSync.start(msg);
               }, 500);
             }
           }, 1000);
